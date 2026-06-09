@@ -80,6 +80,20 @@
       "max_per_run": 6,
       "fold_into_description": true,
       "leave_unresolved_as_open_marker": "[OTVORENÉ]"
+    },
+
+    "auth_scheme": "",
+    "api_version": "",
+    "note_payload_shape": "",
+    "note_body_format": "html",
+    "task_create_estimate_field": "estimatedMinutes",
+    "attachment_upload_endpoint": "",
+    "attachment_attach_endpoint": "",
+    "file_download_endpoint": "",
+
+    "timing": {
+      "report_run_duration": true,
+      "duration_format": "human"
     }
   }
 }

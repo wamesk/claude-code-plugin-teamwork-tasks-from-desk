@@ -1,6 +1,6 @@
 ---
 name: teamwork-tasks-from-desk
-version: 1.0.0
+version: 1.0.1
 description: "Use when the user provides a Teamwork.com Desk ticket URL (https://<workspace>.teamwork.com/desk/tickets/<id>) and asks to 'vytvor tasky z desk ticketu', 'preklop ticket do projects', 'urob task z desku', 'spracuj desk ticket', 'vytvor projektový task z desku', 'create projects task from desk', 'turn desk ticket into projects task', 'desk ticket to task', or invokes '/teamwork-tasks-from-desk'. Fetches the Desk ticket (subject, customer, chronological thread of replies/notes, email attachments) via the Teamwork Desk REST API, asks for a target Teamwork Projects URL (project/tasklist) and an assignee email (asks for an email per role when the task splits into BE/FE/QA/migration), then interactively drafts a main task in the canonical WAME format ([preamble] → HR → Akceptačné kritériá → HR → Cieľ → HR → Technický popis) with optional subtasks and a WAME-methodology estimate. Asks clarifying questions via AskUserQuestion in batches of 4 (max 6 per run) and asks per attachment where it belongs. After a full preview + confirmation creates the task (and subtasks) via /projects/api/v3, uploads attachments via the pending-file flow, and links the main task back to the originating Desk ticket — using the native Teamwork Desk-link attribute when available, falling back to a URL in the description footer. Closes the loop by posting an internal note in the Desk thread containing both the link to the new Projects task and a structured summary of what was prepared (title, AC count, subtasks list, estimate, attachments uploaded, goal), and finally offers to draft a customer-facing reply — the draft is ALWAYS posted as an internal note for review, NEVER sent to the customer (the plugin never touches the Desk replies endpoint). Reuses the shared API token config; Desk uses its own token stored alongside the Projects token. Never replies to the customer, never moves the Desk ticket on its board, never logs time, never moves tasks on the Projects board."
 argument-hint: "<desk-ticket-url> [--projects-url=<url>] [--assignee=<email>] [--no-subtasks] [--language=sk|en] [--write-back=ask|auto|never] [--attach-mode=ask|distribute|main] [--notify-desk=ask|true|false] [--draft-reply=ask|true|false] [--draft-tone=formal|casual|empathetic] [--max-questions=N]"
 allowed-tools: [Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion]
@@ -91,6 +91,23 @@ DESK_BASE="${BASE_URL}/desk"
 If `WORKSPACE` or `TICKET_ID` is empty, ask via **AskUserQuestion** for a
 corrected URL. Do not guess.
 
+### Step 1.1 — Record run start time (for Step 14 duration report)
+
+**New in 1.0.1.** Capture a monotonic-friendly start timestamp **before any
+network I/O** so that the final report can show how long the whole run took
+(skill invocation → task created → internal note posted). Use UTC ISO-8601 +
+epoch seconds — the epoch lets us compute the delta without date parsing
+gymnastics on macOS, and the ISO string is human-readable in the final report.
+
+```bash
+RUN_START_EPOCH=$(date -u +%s)
+RUN_START_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+```
+
+These two variables are referenced once more in Step 14. Do **not** try to make
+them session-global / exported — `bash` subshells in pipeline stages would lose
+them. Keep them as plain shell variables in the top scope of the run.
+
 ---
 
 ## Step 2 — Load shared config (Projects + Desk tokens)
@@ -132,8 +149,11 @@ Algorithm:
    `--language`, `--write-back`, `--attach-mode`, `--notify-desk`,
    `--draft-reply`, `--draft-tone`, `--max-questions`) to the in-memory config
    — do not persist.
-9. **Never echo any token.** Always pass auth to `curl` via `-u "$TOKEN:xxx"`
-   (kept out of `ps`), never in the URL or in `set -x` output.
+9. **Never echo any token.** For older opaque tokens, pass auth via
+   `-u "$TOKEN:xxx"` (Basic auth, kept out of `ps`). For newer tokens that
+   begin with `tkn.v1_` use HTTP Bearer instead (see Step 2.6 below — Bearer is
+   detected automatically and persisted in `.desk_skill.auth_scheme`).
+   Never put a token in a URL or in `set -x` output.
 
 ### Step 2.5 — Desk-skill config defaults (idempotent merge)
 
@@ -199,8 +219,45 @@ jq '
 | .desk_skill.clarifying_questions.max_per_run      //= 6
 | .desk_skill.clarifying_questions.fold_into_description //= true
 | .desk_skill.clarifying_questions.leave_unresolved_as_open_marker //= "[OTVORENÉ]"
+| .desk_skill.auth_scheme                           //= ""
+| .desk_skill.note_payload_shape                    //= ""
+| .desk_skill.note_body_format                      //= "html"
+| .desk_skill.task_create_estimate_field            //= "estimatedMinutes"
+| .desk_skill.attachment_upload_endpoint            //= ""
+| .desk_skill.attachment_attach_endpoint            //= ""
+| .desk_skill.file_download_endpoint                //= ""
+| .desk_skill.timing                                //= {}
+| .desk_skill.timing.report_run_duration            //= true
+| .desk_skill.timing.duration_format                //= "human"
 ' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE" && chmod 600 "$CONFIG_FILE"
 ```
+
+New keys introduced in **1.0.1** (all empty defaults — populated on first
+successful run, idempotently re-used on every subsequent run):
+
+- `desk_skill.auth_scheme` — `"bearer"` or `"basic"`. Probed once in Step 2.6
+  and persisted; subsequent runs skip the probe.
+- `desk_skill.note_payload_shape` — `"v2_messages_top_level"` (modern Desk
+  workspaces) or `"v2_threads_nested"` (older). Probed once in Step 13 by
+  posting a no-op note + DELETE if delete is allowed; otherwise probed by
+  POST + observing the failure-vs-success contract. Persisted.
+- `desk_skill.note_body_format` — `"html"` (default, since markdown is **not**
+  rendered by Teamwork Desk) or `"text"`. Step 13/13b render the note body
+  with HTML tags (`<h3>`, `<p>`, `<a>`, `<pre>`, `<ul>/<li>`, `<blockquote>`)
+  instead of markdown so it displays correctly in the Desk UI.
+- `desk_skill.task_create_estimate_field` — request field name for setting the
+  estimate at POST time. Defaults to `estimatedMinutes` (Teamwork v3 quirk:
+  the **read** field is `estimateMinutes` but the **write** field is
+  `estimatedMinutes` with a `d` — they are not interchangeable). Persisted so
+  Step 10 can use it directly.
+- `desk_skill.attachment_upload_endpoint` — `"v1/pendingFiles"` (proven
+  working) or `"v3/files"`. Probed and persisted in Step 12.
+- `desk_skill.attachment_attach_endpoint` — `"v1_put_task"` (proven working
+  with `pendingFileAttachments: "<ref>"` string) or `"v3_patch_attachments"`.
+- `desk_skill.file_download_endpoint` — `"v2_download_json"` for the working
+  `/files/{id}/download.json` (303 redirect → signed S3) path. Older versions
+  used `/files/{id}.json` (metadata, 403 on most tiers).
+- `desk_skill.timing` — controls Step 14 duration reporting (default ON).
 
 Load all values into local variables for the rest of the run:
 
@@ -209,25 +266,86 @@ PROJECTS_TOKEN=$(jq -r '.teamwork.api_token'  "$CONFIG_FILE")
 DESK_TOKEN=$(   jq -r '.teamwork.desk_token'  "$CONFIG_FILE")
 BASE_URL=$(     jq -r '.teamwork.base_url'    "$CONFIG_FILE")
 DESK_BASE=$(    jq -r '(.teamwork.desk_base_url // "") | if . == "" then "'"$BASE_URL"'/desk" else . end' "$CONFIG_FILE")
-PROJECTS_AUTH="${PROJECTS_TOKEN}:xxx"
-DESK_AUTH="${DESK_TOKEN}:xxx"
+PROJECTS_AUTH="${PROJECTS_TOKEN}:xxx"     # Basic auth for Projects (always)
 ```
+
+`DESK_AUTH` is **not** set here yet — Desk auth scheme is auto-detected in
+Step 2.6 below because newer `tkn.v1_*` tokens require Bearer auth, while
+older opaque tokens use Basic.
+
+### Step 2.6 — Auto-detect Desk auth scheme (Bearer vs Basic) — NEW in 1.0.1
+
+Teamwork Desk supports two auth schemes:
+
+- **Basic auth** — `-u "${DESK_TOKEN}:xxx"` for legacy opaque tokens.
+- **Bearer auth** — `-H "Authorization: Bearer ${DESK_TOKEN}"` for newer tokens
+  generated via the modern Desk Settings → API Keys flow. These tokens have a
+  recognisable prefix (`tkn.v1_…`) and **Basic auth returns 401** for them.
+
+The skill probes both schemes once and persists the working one in
+`desk_skill.auth_scheme`. Subsequent runs skip the probe.
+
+```bash
+DESK_AUTH_SCHEME=$(jq -r '.desk_skill.auth_scheme // ""' "$CONFIG_FILE")
+
+probe_desk_auth() {
+  # Tries the requested scheme against /me.json (cheap, always available).
+  local scheme="$1"
+  local probe_url="${DESK_BASE}/api/v2/me.json"
+  case "$scheme" in
+    bearer) curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $DESK_TOKEN" "$probe_url" ;;
+    basic)  curl -sS -o /dev/null -w '%{http_code}' \
+              -u "${DESK_TOKEN}:xxx" "$probe_url" ;;
+  esac
+}
+
+if [ -z "$DESK_AUTH_SCHEME" ]; then
+  # Probe in priority order: bearer (newer) → basic (legacy).
+  for SCHEME in bearer basic; do
+    HTTP=$(probe_desk_auth "$SCHEME")
+    if [ "$HTTP" = "200" ]; then DESK_AUTH_SCHEME="$SCHEME"; break; fi
+  done
+  if [ -z "$DESK_AUTH_SCHEME" ]; then
+    echo "❌ Could not authenticate to Desk API at ${DESK_BASE}. Tried bearer + basic on /me.json."
+    echo "   Re-check the Desk token in ~/.claude/plugins/data/teamwork-task-wamesk/config.json"
+    exit 1
+  fi
+  TMP=$(mktemp); jq --arg s "$DESK_AUTH_SCHEME" '.desk_skill.auth_scheme = $s' \
+    "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE" && chmod 600 "$CONFIG_FILE"
+fi
+```
+
+Build a single `desk_curl` helper used by every subsequent Desk API call so the
+auth scheme is applied transparently and never duplicated:
+
+```bash
+desk_curl() {
+  # Usage: desk_curl <curl-args...>
+  # Adds the correct auth header/flag based on $DESK_AUTH_SCHEME.
+  case "$DESK_AUTH_SCHEME" in
+    bearer) curl -sS -H "Authorization: Bearer $DESK_TOKEN" "$@" ;;
+    basic)  curl -sS -u "${DESK_TOKEN}:xxx" "$@" ;;
+  esac
+}
+```
+
+From this point onward in the document, replace every `curl -sS -u "$DESK_AUTH" …`
+or `-H "Authorization: Bearer …"` invocation with `desk_curl …`.
 
 ---
 
 ## Step 3 — Fetch the Desk ticket
 
-Teamwork Desk REST uses the same HTTP Basic auth as Projects, with the Desk
-token. The version path may be `/desk/api/v2/` on most workspaces; on older
-ones it may be `/desk/api/v1/` or unversioned. The skill probes v2 first and
-falls back gracefully, recording the working version into the config for
-subsequent runs:
+The version path may be `/desk/api/v2/` on most workspaces; on older ones it
+may be `/desk/api/v1/`. The skill probes v2 first and falls back gracefully,
+recording the working version into the config for subsequent runs:
 
 ```bash
 DESK_API_VERSION=$(jq -r '.desk_skill.api_version // ""' "$CONFIG_FILE")
 if [ -z "$DESK_API_VERSION" ]; then
   for V in v2 v1; do
-    HTTP=$(curl -sS -o /dev/null -w '%{http_code}' -u "$DESK_AUTH" \
+    HTTP=$(desk_curl -o /dev/null -w '%{http_code}' \
       "${DESK_BASE}/api/${V}/tickets/${TICKET_ID}.json")
     if [ "$HTTP" = "200" ]; then DESK_API_VERSION="$V"; break; fi
   done
@@ -244,8 +362,25 @@ DESK_API="${DESK_BASE}/api/${DESK_API_VERSION}"
 ### Step 3.1 — Ticket details (subject, customer, inbox)
 
 ```bash
-TICKET_JSON=$(curl -sS -u "$DESK_AUTH" \
+TICKET_JSON=$(desk_curl \
   "${DESK_API}/tickets/${TICKET_ID}.json?include=customer,inbox,assignee")
+```
+
+**Note on `?include=`** — v2 may return an empty `included: []` even when the
+include parameter is accepted (workspace-tier dependent). The skill must
+**not** assume `included.customers[]` / `included.inboxes[]` are populated.
+If they are empty, fetch each by id separately:
+
+```bash
+CUSTOMER_ID=$(jq -r '.ticket.customer.id // .customer.id // empty' <<<"$TICKET_JSON")
+INBOX_ID=$(   jq -r '.ticket.inbox.id    // .inbox.id    // empty' <<<"$TICKET_JSON")
+
+if [ -n "$CUSTOMER_ID" ] && [ "$(jq -r '.included.customers // {} | length' <<<"$TICKET_JSON")" = "0" ]; then
+  CUSTOMER_JSON=$(desk_curl "${DESK_API}/customers/${CUSTOMER_ID}.json")
+fi
+if [ -n "$INBOX_ID" ] && [ "$(jq -r '.included.inboxes // {} | length' <<<"$TICKET_JSON")" = "0" ]; then
+  INBOX_JSON=$(desk_curl "${DESK_API}/inboxes/${INBOX_ID}.json")
+fi
 ```
 
 Extract:
@@ -266,54 +401,124 @@ If HTTP 401 → re-prompt the Desk token (re-run Step 2 first-run flow). 403/404
 
 ### Step 3.2 — Chronological thread
 
+Try `/threads.json` first (older shape); on 404 fall back to `/messages.json`
+(modern Desk workspaces — what the v2 path actually exposes):
+
 ```bash
-THREADS=$(curl -sS -u "$DESK_AUTH" \
-  "${DESK_API}/tickets/${TICKET_ID}/threads.json?page=1&pageSize=100&orderBy=createdAt&orderMode=asc")
+THREADS_URL="${DESK_API}/tickets/${TICKET_ID}/threads.json?page=1&pageSize=100&orderBy=createdAt&orderMode=asc"
+HTTP=$(desk_curl -o /tmp/threads.json -w '%{http_code}' "$THREADS_URL")
+
+if [ "$HTTP" != "200" ]; then
+  # Modern workspaces only expose /messages.json — same shape but uses
+  # `messages[]` instead of `threads[]` and `threadType` enum instead of
+  # `channel`. Both schemes carry an `htmlBody`/`textBody` per item.
+  THREADS_URL="${DESK_API}/tickets/${TICKET_ID}/messages.json?page=1&pageSize=100&orderBy=createdAt&orderMode=asc"
+  desk_curl -o /tmp/threads.json "$THREADS_URL"
+fi
+
+THREADS=$(cat /tmp/threads.json)
 ```
 
-Page through if `meta.totalPages > 1`. For each thread item collect: `id`,
-`body` (HTML), `createdAt`, `author.name`, `channel` (email vs note vs
-internal), `isInternal` (bool), `attachments[]`.
+Page through if `pagination.pages > 1` (older: `meta.totalPages`). Item array
+key is whichever of `threads[]` or `messages[]` is present. For each item
+collect: `id`, `htmlBody`, `textBody`, `createdAt`, `createdBy.id`,
+`threadType` (one of `message`, `note`, `eventInfo`), `files[]`.
 
-Convert each `body` to markdown — prefer `pandoc -f html -t markdown_strict`,
-fall back to `python -m html2text` or a `sed`-based stripper. Keep the
-chronological order: earliest first.
+The `createdBy.type` distinguishes `customers` (the ticket reporter) from
+`users` (your agents). Look up the customer's first message by filtering
+`threadType == "message" AND createdBy.type == "customers"` and picking the
+earliest `createdAt`. This is the source for the AC extraction in Step 5.
 
-Detect the **first customer-initiated message** — usually the earliest
-`channel == "email"` from the customer (not the agent). This is the source for
-the AC extraction in Step 5.
+**Markdown conversion:** convert each `htmlBody` to markdown — prefer
+`pandoc -f html -t markdown_strict`, fall back to `python -m html2text` or a
+`sed`-based stripper. Keep chronological order: earliest first.
+
+**Agent identity resolution:** the team-side notes carry only
+`createdBy.id` referring to users. To label them (`agent Mário`, `Allcoo Bot`),
+fetch each unique user id once via `GET ${DESK_API}/users/${id}.json` (200 OK
+on most tiers). Cache the lookups for the rest of the run.
 
 ### Step 3.3 — Attachments
 
-Attachments may appear in two places: dedicated `/attachments.json` endpoint
-and inline within each thread's `attachments[]`. Collect both, deduplicate by
-attachment `id`.
+Each thread/message item carries a `files: [{id, type: "files"}, …]` array
+referencing **file ids** on the ticket. Collect every unique file id across
+the chronological items.
+
+The dedicated `/tickets/{id}/attachments.json` endpoint and the
+`/files/{id}.json` metadata endpoint are **gated** behind a "You Must Upgrade
+Your Account" tier on many workspaces (both return HTTP 403 + error code E5).
+Do not rely on them for either listing or metadata.
 
 ```bash
-ATT_INDEX=$(curl -sS -u "$DESK_AUTH" \
-  "${DESK_API}/tickets/${TICKET_ID}/attachments.json?page=1&pageSize=100")
+# Build file_id set from the threads payload directly — NOT from /attachments.json
+FILE_IDS=$(jq -r '
+  (.messages // .threads // []) | .[]?.files // [] | .[]?.id
+' /tmp/threads.json | sort -u)
 ```
 
-For each attachment (whether from the index or inline within a thread), record:
-`id`, `filename`, `size` (bytes), `mimeType`, `downloadURL`.
-
-Filter by config:
-
-```bash
-MAX_MB=$(jq -r '.desk_skill.attachments.max_attachment_size_mb' "$CONFIG_FILE")
-ALLOW=( $(jq -r '.desk_skill.attachments.extensions_allow[]' "$CONFIG_FILE") )
-```
-
-Skip files larger than `MAX_MB` MB; record them in the report as `⏭ too large`.
-Skip extensions not in the allow-list; record them as `⏭ extension blocked`.
-
-Download surviving attachments into a per-run temp directory:
+For each `file_id`, attempt the **download endpoint with the 303-follow
+trick** (works on the gated tier where the metadata endpoint does not):
 
 ```bash
 RUN_ID="$(date +%s)-${RANDOM}"
 ATT_DIR="${TMPDIR:-/tmp}/teamwork-tasks-from-desk-${RUN_ID}/attachments"
 mkdir -p "$ATT_DIR"
-curl -sS -u "$DESK_AUTH" -L -o "${ATT_DIR}/${FILENAME}" "$DOWNLOAD_URL"
+
+MAX_MB=$(jq -r '.desk_skill.attachments.max_attachment_size_mb' "$CONFIG_FILE")
+ALLOW=( $(jq -r '.desk_skill.attachments.extensions_allow[]' "$CONFIG_FILE") )
+
+for FILE_ID in $FILE_IDS; do
+  # ★ The working download endpoint (returns 303 → signed S3 URL):
+  #   GET ${DESK_API}/files/${FILE_ID}/download.json
+  # NOT ${DESK_API}/files/${FILE_ID}.json   ← 403 on gated tiers
+  # NOT ${DESK_API}/tickets/${TICKET_ID}/attachments.json  ← 403 on gated tiers
+  TMP_PATH="${ATT_DIR}/_pending_${FILE_ID}"
+  HTTP=$(desk_curl -L -o "$TMP_PATH" -w '%{http_code}' \
+    "${DESK_API}/files/${FILE_ID}/download.json")
+
+  if [ "$HTTP" != "200" ]; then
+    ATTACHMENT_FAILURES+=("file_${FILE_ID}: download HTTP ${HTTP}")
+    rm -f "$TMP_PATH"
+    continue
+  fi
+
+  # File-size check — the size is only known post-download here because the
+  # /files/{id}.json metadata endpoint is gated. Cheap enough: if oversized,
+  # discard and warn.
+  SIZE=$(stat -f %z "$TMP_PATH" 2>/dev/null || stat -c %s "$TMP_PATH")
+  SIZE_MB=$(( SIZE / 1048576 ))
+  if [ "$SIZE_MB" -gt "$MAX_MB" ]; then
+    echo "⏭ file_${FILE_ID} too large (${SIZE_MB} MB > ${MAX_MB} MB)"
+    rm -f "$TMP_PATH"
+    continue
+  fi
+
+  # Sniff the real filename from the (S3) Content-Disposition header.
+  # Fallback: probe the .eml first message body (contains "File:  XXX")
+  # or use file_${FILE_ID} as a last resort.
+  FILENAME="$(desk_curl -I -L "${DESK_API}/files/${FILE_ID}/download.json" \
+    | grep -i 'content-disposition' \
+    | sed -nE 's/.*filename="?([^"]+)"?.*/\1/p' \
+    | tr -d '\r' | head -1)"
+  [ -z "$FILENAME" ] && FILENAME="file_${FILE_ID}"
+
+  # Extension allow-list check
+  EXT="${FILENAME##*.}"; EXT="${EXT,,}"
+  if ! printf '%s\n' "${ALLOW[@]}" | grep -qFx "$EXT"; then
+    echo "⏭ ${FILENAME}: extension '${EXT}' blocked by config"
+    rm -f "$TMP_PATH"
+    continue
+  fi
+
+  mv "$TMP_PATH" "${ATT_DIR}/${FILENAME}"
+done
+```
+
+Persist the working file-download endpoint on first success:
+
+```bash
+TMP=$(mktemp); jq '.desk_skill.file_download_endpoint = "v2_download_json"' \
+  "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE" && chmod 600 "$CONFIG_FILE"
 ```
 
 For binary documents (PDF/DOCX/XLSX/PPTX), also extract text into a sibling
@@ -681,27 +886,101 @@ directly.
 
 ## Step 10 — Create the main task in Projects
 
+**Critical 1.0.1 lessons:**
+
+1. The Teamwork v3 task POST **rejects multi-line non-ASCII descriptions**
+   when encoded by `jq` because `jq -n --arg desc "$MAIN_DESC"` may pass
+   embedded control characters through unescaped. **Always encode the JSON
+   payload with Python**, which uses `json.dump(..., ensure_ascii=False)` and
+   handles every code point correctly.
+2. The **read** field for an estimate on a Teamwork v3 task is
+   `estimateMinutes`. The **write** field is `estimatedMinutes` (extra `d`).
+   They are **not** interchangeable. Sending `estimateMinutes` on POST is
+   silently accepted but the value lands as 0. Use the persisted
+   `desk_skill.task_create_estimate_field` config key (default
+   `estimatedMinutes`).
+3. **Idempotency guard:** if the same POST appears to fail (e.g. a downstream
+   `jq` view of the response throws a parse error), the task **may have
+   actually been created**. Before retrying, query
+   `GET /projects/api/v3/tasklists/{id}/tasks.json?searchTerm={MAIN_NAME}` and
+   skip the retry if a freshly-created (last ~60 s) task with the same name
+   already exists.
+
 ```bash
-MAIN_PAYLOAD=$(jq -n \
-  --arg name  "$MAIN_NAME" \
-  --arg desc  "$MAIN_DESC" \
-  --arg est   "$MAIN_EST" \
-  --arg uid   "${ASSIGNEE_ID_FOR_MAIN:-}" \
-  '{ task: (
-       { name: $name, description: $desc, estimateMinutes: ($est|tonumber) }
-       + ( if $uid == "" then {} else { assignees: [{type:"user", id:($uid|tonumber)}] } end )
-  )}')
+# Write the description body to a temp file so Python can read it raw — this
+# avoids every quoting + escaping pitfall.
+DESC_PATH="$(mktemp)"
+printf '%s' "$MAIN_DESC" > "$DESC_PATH"
 
-RESP=$(curl -sS -u "$PROJECTS_AUTH" \
-  -H "Content-Type: application/json" -H "Accept: application/json" \
-  -X POST -d "$MAIN_PAYLOAD" \
-  "${BASE_URL}/projects/api/v3/tasklists/${TASKLIST_ID}/tasks.json")
+EST_FIELD=$(jq -r '.desk_skill.task_create_estimate_field // "estimatedMinutes"' "$CONFIG_FILE")
 
-MAIN_TASK_ID=$(jq -r '.task.id // .id // empty' <<<"$RESP")
-if [ -z "$MAIN_TASK_ID" ]; then
-  echo "❌ Main task creation failed:"; echo "$RESP"; exit 1
+PAYLOAD_PATH="$(mktemp)"
+python3 - "$DESC_PATH" "$PAYLOAD_PATH" <<PY
+import json, sys
+desc_path, payload_path = sys.argv[1], sys.argv[2]
+desc = open(desc_path).read()
+payload = {
+    "task": {
+        "name":            ${MAIN_NAME@Q},
+        "description":     desc,
+        "${EST_FIELD}":    ${MAIN_EST},
+    }
+}
+assignee_id = ${ASSIGNEE_ID_FOR_MAIN:-0}
+if assignee_id:
+    payload["task"]["assignees"] = {"userIds": [assignee_id]}
+parent_id = ${PARENT_TASK_ID:-0}
+if parent_id:
+    payload["task"]["parentTaskId"] = parent_id
+json.dump(payload, open(payload_path, "w"), ensure_ascii=False)
+PY
+
+# ★ Idempotency probe BEFORE the POST — only triggered on retry.
+#   Skip on the very first attempt (RETRY_ATTEMPT = 0) for speed.
+if [ "${RETRY_ATTEMPT:-0}" -gt 0 ]; then
+  EXISTING=$(curl -sS -u "$PROJECTS_AUTH" \
+    "${BASE_URL}/projects/api/v3/tasklists/${TASKLIST_ID}/tasks.json?searchTerm=${MAIN_NAME_URL_ENCODED}&pageSize=5" \
+    | python3 -c "
+import json,sys,datetime
+d=json.load(sys.stdin); now=datetime.datetime.utcnow()
+for t in d.get('tasks',[]):
+    if t.get('name') == ${MAIN_NAME@Q}:
+        # Skip if created in the last 60 s (assume it is our prior attempt).
+        ts = t.get('dateCreated') or t.get('dateUpdated') or ''
+        try:
+            dt = datetime.datetime.strptime(ts.rstrip('Z'), '%Y-%m-%dT%H:%M:%S')
+            if (now - dt).total_seconds() < 60:
+                print(t['id']); break
+        except Exception: pass
+")
+  if [ -n "$EXISTING" ]; then
+    MAIN_TASK_ID="$EXISTING"
+    echo "↩ Reusing existing task #${MAIN_TASK_ID} (idempotency guard hit)"
+  fi
 fi
+
+if [ -z "${MAIN_TASK_ID:-}" ]; then
+  HTTP=$(curl -sS -u "$PROJECTS_AUTH" \
+    -H "Content-Type: application/json" -H "Accept: application/json" \
+    -X POST -d @"$PAYLOAD_PATH" \
+    -o /tmp/tw_main_resp.json -w '%{http_code}' \
+    "${BASE_URL}/projects/api/v3/tasklists/${TASKLIST_ID}/tasks.json")
+
+  MAIN_TASK_ID=$(python3 -c "
+import json
+d = json.load(open('/tmp/tw_main_resp.json'))
+t = d.get('task', d)
+print(t.get('id') or '')")
+  if [ -z "$MAIN_TASK_ID" ]; then
+    echo "❌ Main task creation failed (HTTP ${HTTP}):"
+    head -c 1000 /tmp/tw_main_resp.json
+    exit 1
+  fi
+fi
+
 MAIN_TASK_URL="${BASE_URL}/app/tasks/${MAIN_TASK_ID}"
+echo "✅ Main task created: ${MAIN_NAME} (#${MAIN_TASK_ID})"
+rm -f "$DESC_PATH" "$PAYLOAD_PATH"
 ```
 
 Non-2xx on the main POST → render the error body, stop. This is the
@@ -765,34 +1044,48 @@ if [ -z "$SUB_ROLE" ]; then
 fi
 ```
 
-Then POST the subtask:
+Then POST the subtask using the **same Python-encoded payload + correct write
+field** (`estimatedMinutes`) as Step 10:
 
 ```bash
-SUB_PAYLOAD=$(jq -n \
-  --arg name  "$SUB_NAME" \
-  --arg desc  "$SUB_DESC" \
-  --arg est   "$SUB_EST" \
-  --arg parent "$MAIN_TASK_ID" \
-  --arg uid   "${SUB_ASSIGNEE_ID:-}" \
-  '{ task: (
-       { name: $name, description: $desc, estimateMinutes: ($est|tonumber),
-         parentTaskId: ($parent|tonumber) }
-       + ( if $uid == "" then {} else { assignees: [{type:"user", id:($uid|tonumber)}] } end )
-  )}')
+SUB_DESC_PATH="$(mktemp)"
+printf '%s' "$SUB_DESC" > "$SUB_DESC_PATH"
+SUB_PAYLOAD_PATH="$(mktemp)"
+python3 - "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH" <<PY
+import json, sys
+desc = open(sys.argv[1]).read()
+payload = {
+    "task": {
+        "name":            ${SUB_NAME@Q},
+        "description":     desc,
+        "${EST_FIELD}":    ${SUB_EST},
+        "parentTaskId":    ${MAIN_TASK_ID},
+    }
+}
+uid = ${SUB_ASSIGNEE_ID:-0}
+if uid:
+    payload["task"]["assignees"] = {"userIds": [uid]}
+json.dump(payload, open(sys.argv[2], "w"), ensure_ascii=False)
+PY
 
 SUB_RESP=$(curl -sS -u "$PROJECTS_AUTH" \
   -H "Content-Type: application/json" \
-  -X POST -d "$SUB_PAYLOAD" \
+  -X POST -d @"$SUB_PAYLOAD_PATH" \
   "${BASE_URL}/projects/api/v3/tasklists/${TASKLIST_ID}/tasks.json")
 
-SUB_ID=$(jq -r '.task.id // .id // empty' <<<"$SUB_RESP")
+SUB_ID=$(python3 -c "
+import json
+d = json.loads(${SUB_RESP@Q})
+t = d.get('task', d)
+print(t.get('id') or '')")
 if [ -n "$SUB_ID" ]; then
   SUBTASK_IDS+=("$SUB_ID")
   echo "✅ Subtask created: ${SUB_NAME} (#${SUB_ID})"
 else
-  SUBTASK_FAILURES+=("${SUB_NAME}: $(echo "$SUB_RESP" | jq -c '.errors // .message // .')")
+  SUBTASK_FAILURES+=("${SUB_NAME}: $SUB_RESP")
   echo "❌ Subtask failed: ${SUB_NAME}"
 fi
+rm -f "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH"
 ```
 
 Per-subtask failure is **non-fatal** — log and continue with the rest.
@@ -801,52 +1094,119 @@ Per-subtask failure is **non-fatal** — log and continue with the rest.
 
 ## Step 12 — Upload attachments
 
-Use the **pending-file** upload pattern. For each attachment in the Step 8
-mapping that was not skipped:
+**Critical 1.0.1 finding:** the v3 file/attachment shapes documented online
+return **200 OK + empty task.attachments** — they look successful but **do
+not actually attach the file**. The only reliably-working pattern is:
+
+1. **Upload** via **v1** `POST /projects/api/v1/pendingFiles.json` (multipart)
+2. **Attach** via **v1** `PUT /projects/api/v1/tasks/{taskId}.json` with body
+   `{"task": {"pendingFileAttachments": "<ref>"}}` — note that
+   `pendingFileAttachments` is a **comma-separated string** of refs, not an
+   array. Single ref → single string. Multiple → `"ref1,ref2,ref3"`.
+3. **Verify** via v3 `GET /projects/api/v3/tasks/{taskId}.json?include=attachments`
+   — successful attach reports `task.attachments: [{id: <fileId>, type: "files"}]`.
+   If empty, the attach silently failed and the file lives orphaned in the
+   project file library.
 
 ```bash
-# 1) Multipart upload — returns a pending-file ref
-PENDING_RESP=$(curl -sS -u "$PROJECTS_AUTH" -X POST \
-  -F "file=@${ATT_DIR}/${FILENAME}" \
-  -F "fileName=${FILENAME}" \
-  "${BASE_URL}/projects/api/v3/files.json?projectId=${PROJECT_ID}")
+# Persist working endpoints on first success (or read from config on repeat runs).
+UPLOAD_EP=$(jq -r '.desk_skill.attachment_upload_endpoint // "v1/pendingFiles"' "$CONFIG_FILE")
+ATTACH_EP=$(jq -r '.desk_skill.attachment_attach_endpoint // "v1_put_task"'     "$CONFIG_FILE")
 
-PENDING_REF=$(jq -r '
-  (.pendingFile.ref) // (.pendingFile.id) // (.file.id) // (.id) // empty
-' <<<"$PENDING_RESP")
+upload_and_attach() {
+  local file_path="$1"
+  local task_id="$2"
+  local filename="$(basename "$file_path")"
 
-if [ -z "$PENDING_REF" ]; then
-  ATTACHMENT_FAILURES+=("${FILENAME}: pending-file upload failed: $(jq -c . <<<"$PENDING_RESP")")
-  continue
-fi
+  # 1) Multipart upload to v1 pendingFiles — returns {pendingFile:{ref:"tf_..."}}
+  local pending_resp
+  pending_resp=$(curl -sS -u "$PROJECTS_AUTH" -X POST \
+    -F "file=@${file_path};filename=${filename}" \
+    "${BASE_URL}/projects/api/v1/pendingFiles.json")
 
-# 2) PATCH the target task with the pending file ref
-# Some workspaces want pendingFileAttachments[], others pendingFileRefs[].
-# Try the canonical shape first, fall back to the legacy shape on 4xx.
-PATCH1=$(jq -n --arg ref "$PENDING_REF" \
-  '{task:{attachments:{pendingFileAttachments:[$ref]}}}')
-HTTP=$(curl -sS -o /tmp/tw_patch.json -w '%{http_code}' \
-  -u "$PROJECTS_AUTH" -X PATCH -d "$PATCH1" \
-  -H "Content-Type: application/json" \
-  "${BASE_URL}/projects/api/v3/tasks/${TARGET_TASK_ID}.json")
+  local pending_ref
+  pending_ref=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+print(d.get('pendingFile', {}).get('ref') or '')" "$pending_resp")
 
-if [ "$HTTP" != "200" ] && [ "$HTTP" != "204" ]; then
-  PATCH2=$(jq -n --arg ref "$PENDING_REF" \
-    '{task:{pendingFileRefs:[$ref]}}')
-  HTTP=$(curl -sS -o /tmp/tw_patch.json -w '%{http_code}' \
-    -u "$PROJECTS_AUTH" -X PATCH -d "$PATCH2" \
+  if [ -z "$pending_ref" ]; then
+    ATTACHMENT_FAILURES+=("${filename}: pending-file upload failed: $pending_resp")
+    return 1
+  fi
+
+  # 2) Attach via v1 PUT — pendingFileAttachments is a COMMA-SEPARATED STRING,
+  #    not an array. The response confirms with assignedFileIds[].
+  local attach_payload
+  attach_payload=$(python3 -c "
+import json, sys
+ref = sys.argv[1]
+print(json.dumps({'task': {'pendingFileAttachments': ref}}))" "$pending_ref")
+
+  local http
+  local attach_resp
+  attach_resp=$(curl -sS -u "$PROJECTS_AUTH" -X PUT \
     -H "Content-Type: application/json" \
-    "${BASE_URL}/projects/api/v3/tasks/${TARGET_TASK_ID}.json")
-fi
+    -d "$attach_payload" \
+    -o /tmp/tw_attach.json -w '%{http_code}' \
+    "${BASE_URL}/projects/api/v1/tasks/${task_id}.json")
 
-if [ "$HTTP" = "200" ] || [ "$HTTP" = "204" ]; then
-  echo "✅ Uploaded ${FILENAME} → task #${TARGET_TASK_ID}"
-else
-  ATTACHMENT_FAILURES+=("${FILENAME}: attach failed (HTTP $HTTP)")
-fi
+  if [ "$attach_resp" != "200" ] && [ "$attach_resp" != "204" ]; then
+    ATTACHMENT_FAILURES+=("${filename}: v1 PUT attach failed (HTTP $attach_resp)")
+    return 1
+  fi
+
+  # 3) Verify the attachment landed on the task (the silent-fail trap).
+  local assigned
+  assigned=$(python3 -c "
+import json
+d = json.load(open('/tmp/tw_attach.json'))
+print(','.join(d.get('assignedFileIds') or []))")
+
+  if [ -z "$assigned" ]; then
+    ATTACHMENT_FAILURES+=("${filename}: PUT returned 200 but assignedFileIds is empty — possible silent-fail")
+    return 1
+  fi
+
+  echo "✅ Uploaded ${filename} → task #${task_id} (file id ${assigned})"
+  return 0
+}
+
+# Drive the loop over the Step 8 mapping
+for FILE_PATH in "${MAIN_TASK_FILES[@]}"; do
+  upload_and_attach "$FILE_PATH" "$MAIN_TASK_ID" || true
+done
+for i in "${!SUBTASK_IDS[@]}"; do
+  for FILE_PATH in "${SUBTASK_FILES[$i][@]}"; do
+    upload_and_attach "$FILE_PATH" "${SUBTASK_IDS[$i]}" || true
+  done
+done
+
+# Persist on first run when defaults landed
+TMP=$(mktemp); jq '
+  .desk_skill.attachment_upload_endpoint //= "v1/pendingFiles" |
+  .desk_skill.attachment_attach_endpoint //= "v1_put_task"
+' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE" && chmod 600 "$CONFIG_FILE"
 ```
 
 Per-file failure is non-fatal — log and continue.
+
+### Step 12.1 — Things to NOT do (proven dead ends from 1.0.0 in the wild)
+
+These endpoints / shapes were tried during 1.0.0 → 1.0.1 debugging and **all
+silently fail** (HTTP 200/201 but no file ever attached). Do **not** revisit:
+
+- `POST /projects/api/v3/files.json?projectId=X` → 405 Method Not Allowed
+- `POST /projects/api/v3/pendingFiles.json` → 404 Not Found
+- `POST /projects/api/v3/tasks/{id}/files.json` → 404
+- `POST /projects/api/v1/tasks/{id}/files.json` with `{file: {pendingFileRef}}` → 200 OK + STATUS:OK + file not attached
+- `PATCH /projects/api/v3/tasks/{id}.json` with `{task: {attachments: {pendingFileAttachments: ["ref"]}}}` → 200 + no attach
+- `PATCH /projects/api/v3/tasks/{id}.json` with `{task: {pendingFileAttachments: ["ref"]}}` → 200 + no attach
+- `PATCH /projects/api/v3/tasks/{id}.json` with `{task: {attachments: {pendingFiles: ["ref"]}}}` → 200 + no attach
+- `POST /projects/api/v3/tasks/{id}/attach.json` → 404
+
+The single working combination is documented in Step 12 above. Persisting the
+endpoint names in config prevents future probes.
 
 ---
 
@@ -869,52 +1229,113 @@ If `NOTIFY_DESK == "ask"` → run one **AskUserQuestion**:
 If `NOTIFY_DESK == "false"` → skip the note (still record `⏭ skipped` in the
 final report).
 
-The note body is **never** just a link — it always includes a structured
-summary of what was prepared so the support agent sees the outcome without
-having to open the task:
+### Step 13.1 — Body format: HTML, not Markdown (1.0.1)
 
-```markdown
-### 📋 Projects task created from this ticket
+Teamwork Desk **does not render markdown** in note bodies — `**bold**`,
+`### headings`, and `[link](url)` show as raw characters in the UI. The note
+body must be HTML for it to display correctly. Older versions of this skill
+produced markdown notes that the user had to manually re-format; 1.0.1 emits
+HTML by default.
 
-**Task:** [<MAIN_NAME>](<MAIN_TASK_URL>) (#<MAIN_TASK_ID>)
-**Project:** <PROJECT_NAME> · **Tasklist:** <TASKLIST_NAME>
-**Estimate:** <MAIN_EST> min (~<HOURS> h)
-**Assignee:** <name> (or "unassigned")
+The body now uses these HTML elements (all standard, no JS / no custom CSS):
 
-**Akceptačné kritériá (<N>):**
-- AC 1 — <first 80 chars>
-- AC 2 — <first 80 chars>
-- AC 3 — <first 80 chars>
-- … (max 5 shown, rest as "+ <K> more in the task description")
+- `<h3>`, `<h4>` — section headings
+- `<p>`, `<b>`, `<i>`, `<code>` — inline emphasis + monospace
+- `<a href="…">` — links
+- `<ul><li>…</li></ul>` — bullet lists
+- `<pre>` — code blocks (for diffs)
+- `<blockquote>` — quoted text (used in the DRAFT review banner)
+- `<hr>` — section dividers
 
-**Subtasks (<N>):**
-- [BE] <name> (#<id>) — <est> min — <assignee or "unassigned">
-- [FE] <name> (#<id>) — <est> min — <assignee or "unassigned">
+Template:
 
-**Attachments uploaded:** <count> z Desk ticketu prenesené:
-- <filename1> → main task
-- <filename2> → subtask <name>
+```html
+<h3>📋 Projects task vytvorený z tohto Desk ticketu</h3>
 
-**Cieľ:** <first 2–3 sentences extracted from the ## Cieľ section>
+<p><b>Task:</b> <a href="<MAIN_TASK_URL>"><MAIN_NAME></a> (#<MAIN_TASK_ID>)<br>
+<b>Project:</b> <PROJECT_NAME> · <b>Tasklist:</b> <TASKLIST_NAME><br>
+<b>Estimate:</b> <MAIN_EST> min (~<HOURS> h)<br>
+<b>Assignee:</b> <name or "unassigned"></p>
 
-— Vygenerované cez `/teamwork-tasks-from-desk` na <YYYY-MM-DD>
+<h4>📎 Attachments</h4>
+<ul>
+<li><code>filename.xlsx</code> (<size>) → uploaded to task #<MAIN_TASK_ID></li>
+</ul>
+
+<h4>✅ Akceptačné kritériá (<N>)</h4>
+<ul>
+<li><b>AC 1</b> — <first 80 chars></li>
+<li><b>AC 2</b> — <first 80 chars></li>
+…
+</ul>
+
+<h4>📋 Subtasks (<N>)</h4>
+<ul>
+<li>[BE] <name> (#<id>) — <est> min — <assignee or "unassigned"></li>
+</ul>
+
+<h4>🎯 Cieľ</h4>
+<p><first 2–3 sentences extracted from the ## Cieľ section></p>
+
+<p><i>— Vygenerované cez <code>/teamwork-tasks-from-desk</code> na <YYYY-MM-DD></i></p>
 ```
 
-Post as `isInternal: true`:
+### Step 13.2 — Correct Desk messages POST schema (1.0.1)
+
+The skill's 1.0.0 attempt at `POST /threads.json` with body
+`{thread: {type: "note", body: ..., isInternal: true}}` **returns HTTP 403
+"You Must Upgrade Your Account"** on modern Desk workspaces — the
+`/threads.json` POST endpoint is gated behind a higher tier.
+
+The working endpoint on modern v2 workspaces is `POST /messages.json` with a
+**flat** payload — the body is the **top-level `message` string field**,
+threadType is the top-level enum, and `isPrivate: true` is the modern name for
+the "internal note" flag:
 
 ```bash
-NOTE_BODY=$(<the markdown body above, in a heredoc>)
-NOTE_PAYLOAD=$(jq -n --arg body "$NOTE_BODY" \
-  '{thread: { type: "note", body: $body, isInternal: true }}')
-curl -sS -u "$DESK_AUTH" -X POST \
+NOTE_BODY_PATH="$(mktemp)"
+printf '%s' "$NOTE_HTML" > "$NOTE_BODY_PATH"
+
+NOTE_PAYLOAD_PATH="$(mktemp)"
+python3 - "$NOTE_BODY_PATH" "$NOTE_PAYLOAD_PATH" <<PY
+import json, sys
+body = open(sys.argv[1]).read()
+json.dump({
+    "message":     body,
+    "threadType":  "note",
+    "isPrivate":   True,
+    "editMethod":  "html",
+}, open(sys.argv[2], "w"), ensure_ascii=False)
+PY
+
+HTTP=$(desk_curl \
   -H "Content-Type: application/json" \
-  -d "$NOTE_PAYLOAD" \
-  "${DESK_API}/tickets/${TICKET_ID}/threads.json"
+  -X POST -d @"$NOTE_PAYLOAD_PATH" \
+  -o /tmp/tw_note_resp.json -w '%{http_code}' \
+  "${DESK_API}/tickets/${TICKET_ID}/messages.json")
+
+if [ "$HTTP" = "201" ]; then
+  echo "✅ Internal note posted"
+  TMP=$(mktemp); jq '.desk_skill.note_payload_shape = "v2_messages_top_level"' \
+    "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE" && chmod 600 "$CONFIG_FILE"
+else
+  echo "❌ Internal note failed (HTTP $HTTP):"
+  head -c 500 /tmp/tw_note_resp.json
+fi
+rm -f "$NOTE_BODY_PATH" "$NOTE_PAYLOAD_PATH"
 ```
 
-`type: "note"` and `isInternal: true` are **non-negotiable** — the plugin
-deliberately never constructs a `type: "message"` / `reply` / `customer-facing`
-payload, and never uses the `/replies.json` endpoint of the Desk API.
+**Non-negotiable invariants:**
+
+- `threadType: "note"` — never `"message"` (which would be a customer-facing
+  reply on some workspaces) or `"reply"`.
+- `isPrivate: true` — the modern equivalent of the legacy `isInternal: true`.
+  Without it the note may surface in the customer's email thread.
+- `editMethod: "html"` — without this, the body is treated as plain text and
+  HTML tags display literally.
+- The plugin never POSTs to `/replies.json` (the only Desk endpoint that
+  actually sends a customer-facing email reply) — it has no code path that
+  constructs such a payload.
 
 ---
 
@@ -969,40 +1390,60 @@ If `DRAFT_REPLY == "false"` → skip (record `⏭ skipped` in the final report).
 
 ### Posting the DRAFT
 
-The DRAFT is wrapped in a **clearly visible review banner** so a support agent
-who later opens the ticket cannot mistake it for an actual reply:
+The DRAFT is wrapped in a **clearly visible HTML review banner** so a support
+agent who later opens the ticket cannot mistake it for an actual reply (same
+HTML rationale as Step 13.1 — markdown is not rendered):
 
-```markdown
-### ✉️ DRAFT — návrh odpovede pre klienta (pred odoslaním skontrolovať)
+```html
+<h3>✉️ DRAFT — návrh odpovede pre klienta (pred odoslaním skontrolovať)</h3>
 
-> **Toto je INTERNÁ POZNÁMKA. Nebola odoslaná klientovi. Skopíruj, uprav podľa
-> potreby a odošli ako Reply ručne.**
+<blockquote><b>Toto je INTERNÁ POZNÁMKA. Nebola odoslaná klientovi. Skopíruj, uprav podľa
+potreby a odošli ako Reply ručne cez Desk UI.</b></blockquote>
 
----
+<hr>
 
-<the generated reply body>
+<the generated reply body, each paragraph wrapped in &lt;p&gt;…&lt;/p&gt;>
 
----
+<hr>
 
-— Vygenerované cez `/teamwork-tasks-from-desk` na <YYYY-MM-DD>
+<p><i>— Vygenerované cez <code>/teamwork-tasks-from-desk</code> na <YYYY-MM-DD></i></p>
 ```
 
-Post identical to Step 13 — `type: "note"`, `isInternal: true`:
+Post identical to Step 13.2 — `threadType: "note"`, `isPrivate: true`,
+`editMethod: "html"`, body in the top-level `message` field:
 
 ```bash
-DRAFT_PAYLOAD=$(jq -n --arg body "$DRAFT_BODY" \
-  '{thread: { type: "note", body: $body, isInternal: true }}')
-curl -sS -u "$DESK_AUTH" -X POST \
+DRAFT_BODY_PATH="$(mktemp)"
+printf '%s' "$DRAFT_HTML" > "$DRAFT_BODY_PATH"
+
+DRAFT_PAYLOAD_PATH="$(mktemp)"
+python3 - "$DRAFT_BODY_PATH" "$DRAFT_PAYLOAD_PATH" <<PY
+import json, sys
+body = open(sys.argv[1]).read()
+json.dump({
+    "message":     body,
+    "threadType":  "note",
+    "isPrivate":   True,
+    "editMethod":  "html",
+}, open(sys.argv[2], "w"), ensure_ascii=False)
+PY
+
+desk_curl \
   -H "Content-Type: application/json" \
-  -d "$DRAFT_PAYLOAD" \
-  "${DESK_API}/tickets/${TICKET_ID}/threads.json"
+  -X POST -d @"$DRAFT_PAYLOAD_PATH" \
+  "${DESK_API}/tickets/${TICKET_ID}/messages.json" > /dev/null
+rm -f "$DRAFT_BODY_PATH" "$DRAFT_PAYLOAD_PATH"
 ```
 
 ### Hard guarantees
 
-- `type: "note"` and `isInternal: true` are set on **every** Desk POST this
-  skill makes. The plugin never constructs any payload of `type: "message"`,
-  `type: "reply"`, or anything customer-facing.
+- `threadType: "note"` and `isPrivate: true` are set on **every** Desk POST
+  this skill makes. The plugin never constructs any payload of
+  `threadType: "message"`, `threadType: "reply"`, or anything
+  customer-facing. (Pre-1.0.1 wrote `type: "note"` + `isInternal: true` under
+  a nested `thread` envelope — the modern v2 API rejected that schema with
+  400 / 403; the schema above is the only one that produces a note instead
+  of an attempted reply.)
 - The plugin never calls `POST ${DESK_API}/tickets/<id>/replies.json` — that
   endpoint is the only way to send a customer-facing reply in the Desk API,
   and it is explicitly out of scope.
@@ -1015,7 +1456,50 @@ curl -sS -u "$DESK_AUTH" -X POST \
 
 ## Step 14 — Final report
 
-Render a markdown summary into the terminal:
+### Step 14.1 — Compute run duration (1.0.1)
+
+The plugin records the **time-to-deliverables** — from skill invocation
+(`RUN_START_EPOCH` captured in Step 1.1) to the moment the deliverables are
+all in place: the Projects task created **and** the Step 13 internal note
+posted (and the DRAFT, when requested). This gives the user a true
+end-to-end "how long did this hand-off take?" number so future runs can be
+calibrated against it.
+
+```bash
+RUN_END_EPOCH=$(date -u +%s)
+RUN_END_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+RUN_DURATION_SECONDS=$(( RUN_END_EPOCH - RUN_START_EPOCH ))
+RUN_DURATION_MINUTES=$(( RUN_DURATION_SECONDS / 60 ))
+RUN_DURATION_REMAINDER=$(( RUN_DURATION_SECONDS % 60 ))
+
+# Human format like "12 min 34 s" (config: duration_format = "human")
+# Compact format like "12:34"        (config: duration_format = "compact")
+DURATION_FORMAT=$(jq -r '.desk_skill.timing.duration_format // "human"' "$CONFIG_FILE")
+case "$DURATION_FORMAT" in
+  compact) RUN_DURATION_HUMAN=$(printf '%d:%02d' "$RUN_DURATION_MINUTES" "$RUN_DURATION_REMAINDER") ;;
+  *)       RUN_DURATION_HUMAN="${RUN_DURATION_MINUTES} min ${RUN_DURATION_REMAINDER} s" ;;
+esac
+```
+
+The duration block is included in the final report **only when**
+`desk_skill.timing.report_run_duration == true` (default).
+
+### Step 14.2 — Persist the run for later analysis (optional)
+
+When `desk_skill.timing.report_run_duration == true`, also append a one-line
+entry to a per-user history log so the user can compare runs over time:
+
+```bash
+HIST_PATH="${HOME}/.claude/plugins/data/teamwork-task-wamesk/runs.tsv"
+mkdir -p "$(dirname "$HIST_PATH")"
+[ -f "$HIST_PATH" ] || printf 'started_at\tended_at\tduration_s\tticket_id\ttask_id\tsubject\n' > "$HIST_PATH"
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$RUN_START_ISO" "$RUN_END_ISO" "$RUN_DURATION_SECONDS" \
+  "$TICKET_ID" "${MAIN_TASK_ID:-}" "$(printf %s "$SUBJECT" | tr '\t\n' '  ')" \
+  >> "$HIST_PATH"
+```
+
+### Step 14.3 — Render the markdown summary into the terminal
 
 ```markdown
 ## 📨 Desk → Projects task created
@@ -1023,6 +1507,12 @@ Render a markdown summary into the terminal:
 **Desk ticket:** <SUBJECT> (#<TICKET_ID>) — <DESK_BASE>/tickets/<TICKET_ID>
 **Projects task:** <MAIN_NAME> (#<MAIN_TASK_ID>) — <MAIN_TASK_URL>
 **Estimate:** <MAIN_EST> min · **Assignee:** <name or "unassigned">
+
+### ⏱ Run duration
+- Started: <RUN_START_ISO>
+- Ended:   <RUN_END_ISO>
+- Duration: **<RUN_DURATION_HUMAN>** (from skill invocation to task created + Desk note posted)
+- History log: `~/.claude/plugins/data/teamwork-task-wamesk/runs.tsv`
 
 ### Subtasks
 - ✅ [BE] <name> (#<id>) — <est> min — assignee: <name>
@@ -1038,7 +1528,7 @@ Render a markdown summary into the terminal:
 ### Link-back to Desk
 - Native Projects API attribute: <applied / fallback>
 - URL in description footer (### Zdroj): yes
-- Internal Desk note (link + summary): ✅ posted at <DESK_BASE>/tickets/<TICKET_ID> / ⏭ skipped
+- Internal Desk note (link + summary): ✅ posted / ⏭ skipped
 - Customer reply DRAFT (internal note): ✅ posted for review / ⏭ skipped
 
 ### Unresolved
@@ -1046,9 +1536,10 @@ Render a markdown summary into the terminal:
 - [OTVORENÉ] <question 2>
 ```
 
-Cleanup (when `desk_skill.attachments.cleanup == "after_run"`):
+### Step 14.4 — Cleanup
 
 ```bash
+# Default behaviour (desk_skill.attachments.cleanup == "after_run"):
 rm -rf "${TMPDIR:-/tmp}/teamwork-tasks-from-desk-${RUN_ID}"
 ```
 
@@ -1077,31 +1568,48 @@ When `cleanup == "keep"`, print the directory path so the user can inspect it.
 | Failure | Behaviour |
 |---|---|
 | Desk URL unparseable | AskUserQuestion for a corrected URL, stop if still bad |
-| Desk 401 | Re-prompt the Desk token (Step 2 first-run flow) |
-| Desk 403/404 | Stop with the failing URL printed |
-| Desk threads endpoint 404 | Probe v1 → unversioned; record the working one in config |
+| Desk 401 on both Bearer + Basic | Re-prompt the Desk token (Step 2 first-run flow) |
+| Desk 401 on Basic only | Try Bearer (1.0.1 auto-probe); persist `auth_scheme=bearer` |
+| Desk 403 on `/files/{id}.json` | Use `/files/{id}/download.json` 303-follow trick (1.0.1) |
+| Desk 403 on `/attachments.json` | Build the file_id set from `messages[].files[]` instead |
+| Desk 403 on `/threads.json` POST | Use `/messages.json` POST with top-level fields (1.0.1) |
+| Desk 403/404 on other endpoints | Stop with the failing URL printed |
+| Desk thread/messages endpoint 404 | Probe v1; record the working one in config |
 | Projects URL unparseable | AskUserQuestion for a corrected URL |
 | Projects 401 | Re-prompt the Projects token (shared with siblings) |
 | Projects 403 on tasklist | Stop with a clear "no access" message |
 | Email resolves to 0 people | AskUserQuestion (retry / unassigned / cancel) |
 | Email resolves to ≥2 people | AskUserQuestion to pick the right person |
-| Main task POST non-2xx | Render body, stop (load-bearing) |
+| Main task POST returns no id | Idempotency probe (1.0.1) — search by name + recent timestamp before retrying |
 | Subtask POST non-2xx | Log `❌`, continue with the rest |
 | Attachment download non-2xx | Log `⏭`, continue |
-| Attachment PATCH non-2xx | Try the alternative payload shape, then log `❌` |
+| Attachment attach returns 200 but `assignedFileIds` empty | Treat as failure — log `❌`; retry once with v1 PUT (1.0.1 default) |
 | Desk note POST non-2xx | Log `❌`, continue — the task is already created |
+| `jq` parse error when displaying Projects response | Suppress + retry parse via Python; never panic-retry the POST |
 
 ---
 
 ## Persistent learning
 
-On each successful run, the skill writes back into the shared config:
+On each successful run, the skill writes back into the shared config so
+subsequent runs skip the probes:
 
 - `desk_skill.api_version` — the working Desk API version (set in Step 3)
+- `desk_skill.auth_scheme` — `"bearer"` or `"basic"` (set in Step 2.6, 1.0.1)
+- `desk_skill.note_payload_shape` — `"v2_messages_top_level"` (set in Step 13.2, 1.0.1)
+- `desk_skill.note_body_format` — `"html"` (default in 1.0.1)
+- `desk_skill.task_create_estimate_field` — `"estimatedMinutes"` (default in 1.0.1)
+- `desk_skill.attachment_upload_endpoint` — `"v1/pendingFiles"` (set in Step 12, 1.0.1)
+- `desk_skill.attachment_attach_endpoint` — `"v1_put_task"` (set in Step 12, 1.0.1)
+- `desk_skill.file_download_endpoint` — `"v2_download_json"` (set in Step 3.3, 1.0.1)
 - `desk_skill.link_back.notify_desk_default` — if the user picked "Yes and
   don't ask next time" in Step 13
-- `desk_skill.attachments.upload_payload_shape` — the working pending-file
-  shape (`pendingFileAttachments` vs `pendingFileRefs`) discovered in Step 12,
-  so subsequent runs skip the probe
+- `desk_skill.timing.report_run_duration` — `true` by default (Step 14, 1.0.1)
+- `desk_skill.timing.duration_format` — `"human"` or `"compact"` (Step 14, 1.0.1)
+
+A historical TSV log of every run lives at
+`~/.claude/plugins/data/teamwork-task-wamesk/runs.tsv` so the user can
+compare `duration_s` across runs as the skill matures and the probes become
+no-ops.
 
 All writes are atomic (`jq` + `mv` + `chmod 600`).
