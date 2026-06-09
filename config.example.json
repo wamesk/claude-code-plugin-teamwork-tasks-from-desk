@@ -1,0 +1,84 @@
+{
+  "teamwork": {
+    "base_url": "https://<workspace>.teamwork.com",
+    "api_token": "",
+    "desk_token": "",
+    "desk_base_url": ""
+  },
+
+  "default_language": "sk",
+
+  "desk_skill": {
+    "write_back_mode": "ask_each",
+    "description_format": "wame_canonical",
+
+    "sections": {
+      "preamble_label": "",
+      "acceptance_label_sk": "Akceptačné kritériá",
+      "acceptance_label_en": "Acceptance criteria",
+      "goal_label_sk": "Cieľ",
+      "goal_label_en": "Goal",
+      "tech_label_sk": "Technický popis",
+      "tech_label_en": "Technical plan",
+      "source_label_sk": "Zdroj",
+      "source_label_en": "Source",
+      "hr_marker": "---"
+    },
+
+    "estimate": {
+      "methodology": "wame_senior_claude_code",
+      "set_if_missing": true,
+      "buffer_pct_min": 15,
+      "buffer_pct_max": 30,
+      "speedup_pct_min": 30,
+      "speedup_pct_max": 50,
+      "step_minutes": 15,
+      "max_task_minutes": 480
+    },
+
+    "subtasks": {
+      "enabled": true,
+      "propose_split_threshold_minutes": 240,
+      "min_split_subtasks": 2,
+      "max_split_subtasks": 6,
+      "role_prefixes": ["BE", "FE", "QA", "Migration", "DevOps"]
+    },
+
+    "assignee": {
+      "ask_per_role": true,
+      "allow_empty": true
+    },
+
+    "attachments": {
+      "attach_mode": "ask",
+      "max_attachment_size_mb": 25,
+      "extensions_allow": ["md", "txt", "pdf", "docx", "xlsx", "csv", "json", "html", "eml", "msg", "sql", "png", "jpg", "jpeg", "zip"],
+      "cleanup": "after_run"
+    },
+
+    "link_back": {
+      "try_native_desk_link": true,
+      "url_in_description_footer": true,
+      "notify_desk_default": "ask",
+      "notify_desk_include_summary": true
+    },
+
+    "customer_reply_draft": {
+      "enabled": true,
+      "ask_default": "ask",
+      "tone": "formal",
+      "language_detection": "from_ticket",
+      "language_fallback": "sk",
+      "signature": "S pozdravom,\nTím WAME",
+      "include_open_questions": true,
+      "post_as_internal_note": true,
+      "never_send_as_reply": true
+    },
+
+    "clarifying_questions": {
+      "max_per_run": 6,
+      "fold_into_description": true,
+      "leave_unresolved_as_open_marker": "[OTVORENÉ]"
+    }
+  }
+}
