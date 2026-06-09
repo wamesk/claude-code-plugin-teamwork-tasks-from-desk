@@ -147,6 +147,7 @@ jq '
 | .desk_skill.write_back_mode                       //= "ask_each"
 | .desk_skill.description_format                    //= "wame_canonical"
 | .desk_skill.sections                              //= {}
+| .desk_skill.sections.preamble_label               //= ""
 | .desk_skill.sections.acceptance_label_sk          //= "Akceptačné kritériá"
 | .desk_skill.sections.acceptance_label_en          //= "Acceptance criteria"
 | .desk_skill.sections.goal_label_sk                //= "Cieľ"
@@ -743,7 +744,28 @@ the description from Step 5) + the optional Step 13 internal note. Set
 
 ## Step 11 — Create subtasks
 
-For each confirmed subtask, in the order produced by Step 5.3:
+For each confirmed subtask, in the order produced by Step 5.3.
+
+**Per-role assignee mapping** — Step 6.1 produced a map of role → userId
+(empty for unassigned). The role for each subtask comes from its name prefix
+(`[BE]`, `[FE]`, `[QA]`, `[Migration]`, `[DevOps]`). When constructing the
+subtask payload, look up the userId for that role from the Step 6 map:
+
+```bash
+# ASSIGNEE_MAP is a JSON object built in Step 6:
+#   { "BE": "12345", "FE": "67890", "QA": "", ... }
+# Parse the role from the subtask name prefix:
+SUB_ROLE=$(echo "$SUB_NAME" | sed -nE 's|^\[([A-Za-z]+)\].*|\1|p')
+SUB_ASSIGNEE_ID=$(jq -r --arg r "$SUB_ROLE" '.[$r] // ""' <<<"$ASSIGNEE_MAP")
+
+# When the subtask has no role prefix (single-role task, or split disabled),
+# fall back to the main task's assignee:
+if [ -z "$SUB_ROLE" ]; then
+  SUB_ASSIGNEE_ID="${ASSIGNEE_ID_FOR_MAIN:-}"
+fi
+```
+
+Then POST the subtask:
 
 ```bash
 SUB_PAYLOAD=$(jq -n \
@@ -751,7 +773,7 @@ SUB_PAYLOAD=$(jq -n \
   --arg desc  "$SUB_DESC" \
   --arg est   "$SUB_EST" \
   --arg parent "$MAIN_TASK_ID" \
-  --arg uid   "${ASSIGNEE_ID_FOR_SUB:-}" \
+  --arg uid   "${SUB_ASSIGNEE_ID:-}" \
   '{ task: (
        { name: $name, description: $desc, estimateMinutes: ($est|tonumber),
          parentTaskId: ($parent|tonumber) }
@@ -930,7 +952,7 @@ If `DRAFT_REPLY == "false"` → skip (record `⏭ skipped` in the final report).
   ďakujeme za váš podnet týkajúci sa <téma rekapitulovaná z prvej zákazníckej
   správy, 1–2 vety, business-friendly bez technických detailov>.
 
-  Vaš podnet sme zaevidovali a budeme ho riešiť v priebehu cca <estimate
+  Váš podnet sme zaevidovali a budeme ho riešiť v priebehu cca <estimate
   prepočítaný na pracovné dni — round up to whole or half days>. <Stručný popis
   toho, čo bude doručené — 1–2 vety zo `## Cieľ` sekcie tasku, naozaj
   business-friendly>.

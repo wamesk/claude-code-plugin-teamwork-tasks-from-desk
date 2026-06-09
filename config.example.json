@@ -14,6 +14,7 @@
 
     "sections": {
       "preamble_label": "",
+      "preamble_strip_signatures": true,
       "acceptance_label_sk": "Akceptačné kritériá",
       "acceptance_label_en": "Acceptance criteria",
       "goal_label_sk": "Cieľ",
