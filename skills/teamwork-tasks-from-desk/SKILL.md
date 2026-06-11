@@ -1,6 +1,5 @@
 ---
 name: teamwork-tasks-from-desk
-version: 1.0.1
 description: "Use when the user provides a Teamwork.com Desk ticket URL (https://<workspace>.teamwork.com/desk/tickets/<id>) and asks to 'vytvor tasky z desk ticketu', 'preklop ticket do projects', 'urob task z desku', 'spracuj desk ticket', 'vytvor projektový task z desku', 'create projects task from desk', 'turn desk ticket into projects task', 'desk ticket to task', or invokes '/teamwork-tasks-from-desk'. Fetches the Desk ticket (subject, customer, chronological thread of replies/notes, email attachments) via the Teamwork Desk REST API, asks for a target Teamwork Projects URL (project/tasklist) and an assignee email (asks for an email per role when the task splits into BE/FE/QA/migration), then interactively drafts a main task in the canonical WAME format ([preamble] → HR → Akceptačné kritériá → HR → Cieľ → HR → Technický popis) with optional subtasks and a WAME-methodology estimate. Asks clarifying questions via AskUserQuestion in batches of 4 (max 6 per run) and asks per attachment where it belongs. After a full preview + confirmation creates the task (and subtasks) via /projects/api/v3, uploads attachments via the pending-file flow, and links the main task back to the originating Desk ticket — using the native Teamwork Desk-link attribute when available, falling back to a URL in the description footer. Closes the loop by posting an internal note in the Desk thread containing both the link to the new Projects task and a structured summary of what was prepared (title, AC count, subtasks list, estimate, attachments uploaded, goal), and finally offers to draft a customer-facing reply — the draft is ALWAYS posted as an internal note for review, NEVER sent to the customer (the plugin never touches the Desk replies endpoint). Reuses the shared API token config; Desk uses its own token stored alongside the Projects token. Never replies to the customer, never moves the Desk ticket on its board, never logs time, never moves tasks on the Projects board."
 argument-hint: "<desk-ticket-url> [--projects-url=<url>] [--assignee=<email>] [--no-subtasks] [--language=sk|en] [--write-back=ask|auto|never] [--attach-mode=ask|distribute|main] [--notify-desk=ask|true|false] [--draft-reply=ask|true|false] [--draft-tone=formal|casual|empathetic] [--max-questions=N]"
 allowed-tools: [Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion]
@@ -528,7 +527,83 @@ For binary documents (PDF/DOCX/XLSX/PPTX), also extract text into a sibling
 case "$EXT" in
   pdf)  pdftotext -layout "$F" "${F%.pdf}.txt"  2>/dev/null || true ;;
   docx) pandoc -f docx -t plain "$F" -o "${F%.docx}.txt" 2>/dev/null || true ;;
-  xlsx) python3 -c "<csv extractor>" "$F" > "${F%.xlsx}.txt"      2>/dev/null || true ;;
+  xlsx) python3 - "$F" > "${F%.xlsx}.txt" 2>/dev/null <<'PY' || true
+# Pure-stdlib XLSX -> TSV text extractor (no openpyxl/pandas needed).
+# An .xlsx is a zip of XML parts: shared strings live in sharedStrings.xml,
+# cell values in xl/worksheets/sheetN.xml. We resolve shared-string indices
+# and emit one tab-separated line per row, sheets separated by a blank line.
+import sys, zipfile, re
+from xml.etree import ElementTree as ET
+from xml.parsers import expat
+
+NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+def parse(data):
+    # Harden against XXE / billion-laughs from a malicious .xlsx. Valid OOXML
+    # never contains a DOCTYPE, so reject any DTD outright (this fires BEFORE
+    # any entity is declared) and refuse external entity resolution. Build an
+    # ElementTree on top of a raw expat parser so the guards actually stick.
+    builder = ET.TreeBuilder()
+    # namespace_separator -> expat emits "uri\tlocalname"; rewrite to the
+    # "{uri}localname" form ElementTree (and the f"{NS}..." lookups) expect.
+    p = expat.ParserCreate(namespace_separator="\t")
+    def _no_dtd(*a):
+        raise ValueError("DTD/DOCTYPE not allowed in xlsx XML")
+    def _fix(tag):
+        return "{%s}%s" % tuple(tag.split("\t", 1)) if "\t" in tag else tag
+    p.StartDoctypeDeclHandler = _no_dtd
+    p.EntityDeclHandler = _no_dtd
+    p.ExternalEntityRefHandler = lambda *a: False
+    p.StartElementHandler = lambda tag, attrs: builder.start(
+        _fix(tag), {_fix(k): v for k, v in attrs.items()})
+    p.EndElementHandler = lambda tag: builder.end(_fix(tag))
+    p.CharacterDataHandler = lambda d: builder.data(d)
+    p.Parse(data, True)
+    return builder.close()
+
+def col_index(ref):
+    m = re.match(r"([A-Z]+)", ref or "")
+    if not m:
+        return 0
+    n = 0
+    for ch in m.group(1):
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n - 1
+
+with zipfile.ZipFile(sys.argv[1]) as z:
+    shared = []
+    if "xl/sharedStrings.xml" in z.namelist():
+        root = parse(z.read("xl/sharedStrings.xml"))
+        for si in root.findall(f"{NS}si"):
+            shared.append("".join(t.text or "" for t in si.iter(f"{NS}t")))
+
+    sheets = sorted(n for n in z.namelist()
+                    if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+    out = []
+    for sheet in sheets:
+        root = parse(z.read(sheet))
+        for row in root.iter(f"{NS}row"):
+            cells = {}
+            maxc = -1
+            for c in row.findall(f"{NS}c"):
+                idx = col_index(c.get("r"))
+                maxc = max(maxc, idx)
+                v = c.find(f"{NS}v")
+                if c.get("t") == "s" and v is not None:
+                    try:
+                        cells[idx] = shared[int(v.text)]
+                    except (ValueError, IndexError):
+                        cells[idx] = ""
+                elif c.get("t") == "inlineStr":
+                    t = c.find(f"{NS}is/{NS}t")
+                    cells[idx] = t.text or "" if t is not None else ""
+                else:
+                    cells[idx] = v.text or "" if v is not None else ""
+            out.append("\t".join(cells.get(i, "") for i in range(maxc + 1)))
+        out.append("")
+    sys.stdout.write("\n".join(out))
+PY
+        ;;
 esac
 ```
 
@@ -826,6 +901,43 @@ Record the mapping as a simple structure:
 }
 ```
 
+### Step 8.1 — Materialise the file lists for the upload loop (Step 12)
+
+Bash has **no nested arrays**, so do **not** try `SUBTASK_FILES[$i][@]`.
+Instead materialise the mapping above into one flat array for the main task and
+one newline-delimited string variable per subtask index. Subtask index `i` is
+0-based and lines up with `SUBTASK_IDS[$i]` from Step 11. Store **absolute**
+paths under `$ATT_DIR`.
+
+```bash
+# Main task files — a flat bash array of absolute paths.
+MAIN_TASK_FILES=()
+for f in "${MAP_MAIN[@]}"; do          # MAP_MAIN = filenames mapped to "main"
+  MAIN_TASK_FILES+=("${ATT_DIR}/${f}")
+done
+
+# Per-subtask files — one newline-delimited string variable per index, named
+# SUBTASK_FILES_<i>. Build them from the sub_<n> buckets (sub_1 → index 0, …).
+for n in "${!SUBTASK_NAMES[@]}"; do     # n is 0-based; bucket key is sub_$((n+1))
+  bucket="MAP_SUB_$((n + 1))"          # e.g. MAP_SUB_1 = array of filenames
+  # bash 3.2-safe dynamic array read. `declare -n` (nameref) needs bash 4.3+,
+  # but macOS ships bash 3.2.57 where it silently fails and leaves the lists
+  # empty — so the subtask attachments would never upload. eval copies the
+  # dynamically-named array into ref; an unset/empty bucket yields an empty ref.
+  eval "ref=( \"\${${bucket}[@]}\" )" 2>/dev/null || ref=()
+  lines=""
+  for f in "${ref[@]}"; do
+    lines+="${ATT_DIR}/${f}"$'\n'
+  done
+  printf -v "SUBTASK_FILES_${n}" '%s' "$lines"
+done
+```
+
+The `eval "ref=( \"\${${bucket}[@]}\" )"` form above is intentional: it reads a
+dynamically-named array without `declare -n` (nameref), so it works on macOS
+stock bash 3.2 as well as modern bash. `printf -v "SUBTASK_FILES_${n}"` is also
+bash 3.1+ safe, so the whole materialisation block is portable.
+
 ---
 
 ## Step 9 — Full preview + confirmation gate
@@ -907,21 +1019,26 @@ directly.
    already exists.
 
 ```bash
-# Write the description body to a temp file so Python can read it raw — this
-# avoids every quoting + escaping pitfall.
+# Write the task NAME and description body to temp files so Python can read
+# them raw — this avoids every quoting + escaping pitfall. NEVER splice the
+# name into Python source via shell quoting (e.g. ${MAIN_NAME@Q}): shell
+# quoting is not valid Python and a crafted name can break out and execute.
+NAME_PATH="$(mktemp)"
+printf '%s' "$MAIN_NAME" > "$NAME_PATH"
 DESC_PATH="$(mktemp)"
 printf '%s' "$MAIN_DESC" > "$DESC_PATH"
 
 EST_FIELD=$(jq -r '.desk_skill.task_create_estimate_field // "estimatedMinutes"' "$CONFIG_FILE")
 
 PAYLOAD_PATH="$(mktemp)"
-python3 - "$DESC_PATH" "$PAYLOAD_PATH" <<PY
+python3 - "$NAME_PATH" "$DESC_PATH" "$PAYLOAD_PATH" <<PY
 import json, sys
-desc_path, payload_path = sys.argv[1], sys.argv[2]
+name_path, desc_path, payload_path = sys.argv[1], sys.argv[2], sys.argv[3]
+name = open(name_path).read()
 desc = open(desc_path).read()
 payload = {
     "task": {
-        "name":            ${MAIN_NAME@Q},
+        "name":            name,
         "description":     desc,
         "${EST_FIELD}":    ${MAIN_EST},
     }
@@ -938,13 +1055,18 @@ PY
 # ★ Idempotency probe BEFORE the POST — only triggered on retry.
 #   Skip on the very first attempt (RETRY_ATTEMPT = 0) for speed.
 if [ "${RETRY_ATTEMPT:-0}" -gt 0 ]; then
+  # URL-encode the task name for the searchTerm query param.
+  MAIN_NAME_URL_ENCODED=$(python3 -c \
+    "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$MAIN_NAME")
+  # Pass the name to Python via argv (never via shell quoting into source).
   EXISTING=$(curl -sS -u "$PROJECTS_AUTH" \
     "${BASE_URL}/projects/api/v3/tasklists/${TASKLIST_ID}/tasks.json?searchTerm=${MAIN_NAME_URL_ENCODED}&pageSize=5" \
     | python3 -c "
 import json,sys,datetime
+want=sys.argv[1]
 d=json.load(sys.stdin); now=datetime.datetime.utcnow()
 for t in d.get('tasks',[]):
-    if t.get('name') == ${MAIN_NAME@Q}:
+    if t.get('name') == want:
         # Skip if created in the last 60 s (assume it is our prior attempt).
         ts = t.get('dateCreated') or t.get('dateUpdated') or ''
         try:
@@ -952,7 +1074,7 @@ for t in d.get('tasks',[]):
             if (now - dt).total_seconds() < 60:
                 print(t['id']); break
         except Exception: pass
-")
+" "$MAIN_NAME")
   if [ -n "$EXISTING" ]; then
     MAIN_TASK_ID="$EXISTING"
     echo "↩ Reusing existing task #${MAIN_TASK_ID} (idempotency guard hit)"
@@ -980,7 +1102,7 @@ fi
 
 MAIN_TASK_URL="${BASE_URL}/app/tasks/${MAIN_TASK_ID}"
 echo "✅ Main task created: ${MAIN_NAME} (#${MAIN_TASK_ID})"
-rm -f "$DESC_PATH" "$PAYLOAD_PATH"
+rm -f "$NAME_PATH" "$DESC_PATH" "$PAYLOAD_PATH"
 ```
 
 Non-2xx on the main POST → render the error body, stop. This is the
@@ -1048,15 +1170,20 @@ Then POST the subtask using the **same Python-encoded payload + correct write
 field** (`estimatedMinutes`) as Step 10:
 
 ```bash
+# Write the subtask NAME and description to temp files so Python reads them
+# raw — never splice them into Python source via shell quoting (${SUB_NAME@Q}).
+SUB_NAME_PATH="$(mktemp)"
+printf '%s' "$SUB_NAME" > "$SUB_NAME_PATH"
 SUB_DESC_PATH="$(mktemp)"
 printf '%s' "$SUB_DESC" > "$SUB_DESC_PATH"
 SUB_PAYLOAD_PATH="$(mktemp)"
-python3 - "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH" <<PY
+python3 - "$SUB_NAME_PATH" "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH" <<PY
 import json, sys
-desc = open(sys.argv[1]).read()
+name = open(sys.argv[1]).read()
+desc = open(sys.argv[2]).read()
 payload = {
     "task": {
-        "name":            ${SUB_NAME@Q},
+        "name":            name,
         "description":     desc,
         "${EST_FIELD}":    ${SUB_EST},
         "parentTaskId":    ${MAIN_TASK_ID},
@@ -1065,7 +1192,7 @@ payload = {
 uid = ${SUB_ASSIGNEE_ID:-0}
 if uid:
     payload["task"]["assignees"] = {"userIds": [uid]}
-json.dump(payload, open(sys.argv[2], "w"), ensure_ascii=False)
+json.dump(payload, open(sys.argv[3], "w"), ensure_ascii=False)
 PY
 
 SUB_RESP=$(curl -sS -u "$PROJECTS_AUTH" \
@@ -1073,9 +1200,11 @@ SUB_RESP=$(curl -sS -u "$PROJECTS_AUTH" \
   -X POST -d @"$SUB_PAYLOAD_PATH" \
   "${BASE_URL}/projects/api/v3/tasklists/${TASKLIST_ID}/tasks.json")
 
-SUB_ID=$(python3 -c "
-import json
-d = json.loads(${SUB_RESP@Q})
+# Feed the raw server response via stdin (like the main-task response is read
+# from a file) — never splice it into Python source via ${SUB_RESP@Q}.
+SUB_ID=$(printf '%s' "$SUB_RESP" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
 t = d.get('task', d)
 print(t.get('id') or '')")
 if [ -n "$SUB_ID" ]; then
@@ -1085,7 +1214,7 @@ else
   SUBTASK_FAILURES+=("${SUB_NAME}: $SUB_RESP")
   echo "❌ Subtask failed: ${SUB_NAME}"
 fi
-rm -f "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH"
+rm -f "$SUB_NAME_PATH" "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH"
 ```
 
 Per-subtask failure is **non-fatal** — log and continue with the rest.
@@ -1172,14 +1301,25 @@ print(','.join(d.get('assignedFileIds') or []))")
   return 0
 }
 
-# Drive the loop over the Step 8 mapping
+# Drive the loop over the Step 8 mapping.
+#
+# MAIN_TASK_FILES is a flat bash array of absolute file paths for the main task.
+# Per-subtask files are NOT a nested array (bash has no nested arrays). Instead,
+# each subtask index i has its own newline-delimited string variable
+# SUBTASK_FILES_<i> (populated in Step 8 — see "Materialise the file lists").
+# We read it back via indirect expansion.
 for FILE_PATH in "${MAIN_TASK_FILES[@]}"; do
+  [ -n "$FILE_PATH" ] || continue
   upload_and_attach "$FILE_PATH" "$MAIN_TASK_ID" || true
 done
 for i in "${!SUBTASK_IDS[@]}"; do
-  for FILE_PATH in "${SUBTASK_FILES[$i][@]}"; do
+  list_var="SUBTASK_FILES_${i}"
+  list="${!list_var:-}"
+  [ -n "$list" ] || continue
+  while IFS= read -r FILE_PATH; do
+    [ -n "$FILE_PATH" ] || continue
     upload_and_attach "$FILE_PATH" "${SUBTASK_IDS[$i]}" || true
-  done
+  done <<< "$list"
 done
 
 # Persist on first run when defaults landed

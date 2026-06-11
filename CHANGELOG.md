@@ -4,6 +4,47 @@ All notable changes to the `teamwork-tasks-from-desk` plugin are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] — 2026-06-11
+
+Security and correctness hardening of the task-creation path. No user-facing
+workflow changes — the same steps run in the same order — but several silent
+breakages and one shell→Python injection vector are now closed. The skill
+frontmatter no longer carries a `version` field; `plugin.json` is the single
+source of truth for the plugin version.
+
+### Fixed
+
+- **Shell→Python injection / breakage via `${MAIN_NAME@Q}` / `${SUB_NAME@Q}`
+  (Step 10, Step 11).** The Teamwork task name was spliced into an unquoted
+  `python3` heredoc using shell `@Q` quoting, which is not valid Python
+  (`SyntaxError` on apostrophes/control chars) and let a crafted task name
+  break out and execute as Python. The name is now written to a temp file and
+  read by Python from `argv`/stdin — exactly like the description already was.
+- **Raw server JSON spliced into Python via `json.loads(${SUB_RESP@Q})`
+  (Step 11).** A multi-line or control-char subtask response broke the parse
+  and was injectable. The response is now fed to Python over **stdin**, the
+  same way the main-task response is read.
+- **Stubbed XLSX text extraction (Step 3).** The `xlsx` sidecar branch was a
+  literal `python3 -c "<csv extractor>"` placeholder masked by
+  `2>/dev/null || true`, so `.xlsx` attachments silently produced no `.txt`.
+  Replaced with a real pure-stdlib XLSX→TSV extractor (`zipfile` +
+  `xml.etree`, shared-strings aware) hardened against XXE / entity-expansion
+  from a malicious workbook.
+- **Subtask attachments never uploaded (Step 12).** The loop used
+  `"${SUBTASK_FILES[$i][@]}"`, which is invalid bash (no nested arrays), over
+  a `SUBTASK_FILES` variable that was never populated. Replaced with valid
+  per-index newline-delimited `SUBTASK_FILES_<i>` string variables, now
+  materialised from the Step 8 attachment mapping (new Step 8.1).
+- **Weakened duplicate-task guard (Step 10).** The idempotency probe queried
+  `searchTerm=${MAIN_NAME_URL_ENCODED}` against a never-assigned variable
+  (empty search). `MAIN_NAME_URL_ENCODED` is now derived by URL-encoding
+  `MAIN_NAME` before the query.
+
+### Removed
+
+- **`version` field from the SKILL.md YAML frontmatter.** The plugin version
+  now lives solely in `.claude-plugin/plugin.json`.
+
 ## [1.0.1] — 2026-06-09
 
 First-run lessons from the very first invocation against ticket Desk #9954824
