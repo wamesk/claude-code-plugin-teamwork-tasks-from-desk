@@ -1,6 +1,6 @@
 ---
 name: teamwork-tasks-from-desk
-description: "Use when the user provides a Teamwork.com Desk ticket URL (https://<workspace>.teamwork.com/desk/tickets/<id>) and asks to 'vytvor tasky z desk ticketu', 'preklop ticket do projects', 'urob task z desku', 'spracuj desk ticket', 'vytvor projektový task z desku', 'create projects task from desk', 'turn desk ticket into projects task', 'desk ticket to task', or invokes '/teamwork-tasks-from-desk'. Fetches the Desk ticket (subject, customer, chronological thread of replies/notes, email attachments) via the Teamwork Desk REST API, asks for a target Teamwork Projects URL (project/tasklist) and an assignee email (asks for an email per role when the task splits into BE/FE/QA/migration), then interactively drafts a main task in the canonical WAME format ([preamble] → HR → Akceptačné kritériá → HR → Cieľ → HR → Technický popis) with optional subtasks and a WAME-methodology estimate. Asks clarifying questions via AskUserQuestion in batches of 4 (max 6 per run) and asks per attachment where it belongs. After a full preview + confirmation creates the task (and subtasks) via /projects/api/v3, uploads attachments via the pending-file flow, and links the main task back to the originating Desk ticket — using the native Teamwork Desk-link attribute when available, falling back to a URL in the description footer. Closes the loop by posting an internal note in the Desk thread containing both the link to the new Projects task and a structured summary of what was prepared (title, AC count, subtasks list, estimate, attachments uploaded, goal), and finally offers to draft a customer-facing reply — the draft is ALWAYS posted as an internal note for review, NEVER sent to the customer (the plugin never touches the Desk replies endpoint). Reuses the shared API token config; Desk uses its own token stored alongside the Projects token. Never replies to the customer, never moves the Desk ticket on its board, never logs time, never moves tasks on the Projects board."
+description: "Use when the user provides a Teamwork.com Desk ticket URL (https://<workspace>.teamwork.com/desk/tickets/<id>) and asks to 'vytvor tasky z desk ticketu', 'preklop ticket do projects', 'urob task z desku', 'spracuj desk ticket', 'vytvor projektový task z desku', 'create projects task from desk', 'turn desk ticket into projects task', 'desk ticket to task', or invokes '/teamwork-tasks-from-desk'. Fetches the Desk ticket (subject, customer, chronological thread of replies/notes, email attachments) via the Teamwork Desk REST API, asks for a target Teamwork Projects URL (project/tasklist) and an assignee email (asks for an email per role when the task splits into BE/FE/QA/migration), then interactively drafts a main task in the canonical WAME format ([preamble] → HR → Akceptačné kritériá → HR → Cieľ → HR → Technický popis) with optional subtasks and a `wame-estimate-v2` estimate. Asks clarifying questions via AskUserQuestion in batches of 4 (max 6 per run) and asks per attachment where it belongs. After a full preview + confirmation creates the task (and subtasks) via /projects/api/v3, uploads attachments via the pending-file flow, and links the main task back to the originating Desk ticket — using the native Teamwork Desk-link attribute when available, falling back to a URL in the description footer. Closes the loop by posting an internal note in the Desk thread containing both the link to the new Projects task and a structured summary of what was prepared (title, AC count, subtasks list, estimate, attachments uploaded, goal), and finally offers to draft a customer-facing reply — the draft is ALWAYS posted as an internal note for review, NEVER sent to the customer (the plugin never touches the Desk replies endpoint). Reuses the shared API token config; Desk uses its own token stored alongside the Projects token. Never replies to the customer, never moves the Desk ticket on its board, never logs time, never moves tasks on the Projects board."
 argument-hint: "<desk-ticket-url> [--projects-url=<url>] [--assignee=<email>] [--no-subtasks] [--language=sk|en] [--write-back=ask|auto|never] [--attach-mode=ask|distribute|main] [--notify-desk=ask|true|false] [--draft-reply=ask|true|false] [--draft-tone=formal|casual|empathetic] [--max-questions=N]"
 allowed-tools: [Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion]
 ---
@@ -177,14 +177,17 @@ jq '
 | .desk_skill.sections.source_label_en              //= "Source"
 | .desk_skill.sections.hr_marker                    //= "---"
 | .desk_skill.estimate                              //= {}
-| .desk_skill.estimate.methodology                  //= "wame_senior_claude_code"
+| .desk_skill.estimate.methodology                  //= "wame_estimate_v2"
 | .desk_skill.estimate.set_if_missing               //= true
-| .desk_skill.estimate.buffer_pct_min               //= 15
-| .desk_skill.estimate.buffer_pct_max               //= 30
-| .desk_skill.estimate.speedup_pct_min              //= 30
-| .desk_skill.estimate.speedup_pct_max              //= 50
 | .desk_skill.estimate.step_minutes                 //= 15
 | .desk_skill.estimate.max_task_minutes             //= 480
+# v2 estimates one number directly — the speedup/buffer multipliers are gone.
+# Delete them from configs written by 1.0.x so a stale `buffer_pct_max` does
+# not sit in the file reading like a rule somebody still follows.
+| .desk_skill.estimate |= del(.buffer_pct_min, .buffer_pct_max,
+                              .speedup_pct_min, .speedup_pct_max)
+| (if .desk_skill.estimate.methodology == "wame_senior_claude_code"
+   then .desk_skill.estimate.methodology = "wame_estimate_v2" else . end)
 | .desk_skill.subtasks                              //= {}
 | .desk_skill.subtasks.enabled                      //= true
 | .desk_skill.subtasks.propose_split_threshold_minutes //= 240
@@ -763,29 +766,25 @@ Count: 2–6. Never force-split smaller tasks.
 
 ### 5.4 — Estimate
 
-WAME senior + Claude Code methodology:
+Follow the **`## WAME estimate methodology`** block at the bottom of this
+document (`wame-estimate-v2`) — one number per task, picked against the anchors
+there. Do not start from a "traditional" estimate and multiply it down; version
+2 removed the speedup factor and the risk buffer, and this skill must not keep a
+private copy of them.
 
-- Start from a traditional senior-engineer estimate of the task
-- Apply 30–50 % speedup (Claude Code as a force multiplier)
-- Then add 15–30 % buffer for unknowns, friction, review feedback
-- Round to a multiple of `desk_skill.estimate.step_minutes` (default 15)
-- Cap at `desk_skill.estimate.max_task_minutes` (default 480) — anything bigger
-  must be split via Step 5.3
+Two things are specific to this skill:
 
-For each subtask, run the same methodology independently. The main task's
-estimate is the **sum** of its subtask estimates (or the methodology-computed
-value when there are no subtasks).
+- Round to `desk_skill.estimate.step_minutes` (15) and cap at
+  `desk_skill.estimate.max_task_minutes` (480). Above
+  `desk_skill.subtasks.propose_split_threshold_minutes` (240) the work splits via
+  Step 5.3 instead.
+- Estimate every subtask independently, then make the main task's estimate the
+  **sum** of them. With no subtasks the main task carries its own number.
 
-Calibration anchors (in minutes, *post*-speedup, *post*-buffer):
-
-| Task type | Estimate |
-|---|---|
-| Trivial copy / label change | 15 |
-| Bug fix with known repro | 30–60 |
-| Single CRUD with form + table | 60–120 |
-| New Vue/React component with state | 60–120 |
-| New module / domain object end-to-end | 240–360 |
-| Migration with backfill + tests | 120–240 |
+A Desk ticket is written by a customer, not by an engineer, so it will usually
+be short one fact you need in order to size the work. That is an open question
+for Step 7, not a reason to pad the number — read the `Uncertainty is an open
+question, not a surcharge` paragraph in the methodology before you round up.
 
 ---
 
@@ -1684,6 +1683,87 @@ rm -rf "${TMPDIR:-/tmp}/teamwork-tasks-from-desk-${RUN_ID}"
 ```
 
 When `cleanup == "keep"`, print the directory path so the user can inspect it.
+
+---
+
+## WAME estimate methodology
+
+> Block version `wame-estimate-v2`. Shared **verbatim** across the plugins
+> `teamwork-task-analyze`, `teamwork-tasks-from-dnr`, `teamwork-tasks-from-desk`,
+> `teamwork-tasks-from-session` and `dnr-business`. Change it in all five or in
+> none — a per-plugin variant is how two skills start quoting different numbers
+> for the same task.
+
+**Estimate one number, directly.** Do not produce a "traditional" estimate and
+then multiply it by a speedup and a buffer. Two percentages stacked on a guess
+open a band almost twice as wide as the guess itself, and in a negotiation the
+widest end of that band always wins. Name the minutes the work takes and defend
+that number.
+
+**Who does the work.** A senior engineer who already knows this codebase,
+directing Claude Code. Claude Code writes the implementation and the tests; the
+engineer decides, reviews and runs the suite. There is no separate QA pass and
+no handover to a second person.
+
+**What the number covers**
+
+- Reading the relevant code and reproducing the reported behaviour
+- The implementation itself
+- Writing or extending the test, and running the affected tests
+- Self-review and the fixes it produces
+- One round of review feedback
+
+**What the number never covers** — estimate each of these as its own task instead
+of folding it in
+
+- Deployment, running the migration on production, fixing production data
+- Talking to the client or the PO, and waiting for the answer
+- Any work that sits behind an unanswered `[OTVORENÉ]` question
+- Anything the task itself declares out of scope
+
+**Shape of the number**
+
+- A multiple of 15 minutes. Never below 15.
+- Above 240 minutes: propose a split into 2–6 atomic subtasks. That threshold is
+  `propose_split_threshold_minutes` and it is the real ceiling in daily use.
+- 480 minutes is a hard cap. Work that will not fit under it is not a task yet.
+
+**Anchors.** These are finished outcomes, not categories of feeling. Pick the
+closest line and move by at most one 15-minute step. If the number you want is
+more than one step away from every anchor, write down in the reasoning what makes
+this case different — that sentence is what a reviewer checks.
+
+| Finished work | Minutes |
+|---|---|
+| Text, label, translation key or config value, plus the test that guards it | 15 |
+| One field, filter or validation rule on one screen, plus a test | 30 |
+| Bug with a stack trace or a one-line repro: fix plus regression test | 60 |
+| Vue/React component wired to an API that already exists, plus a test | 90 |
+| Bug that reproduces but spans 2–3 layers: fix plus tests | 120 |
+| One CRUD endpoint or one screen end to end, plus tests | 120 |
+| Bug with no repro yet: investigate, then fix | 180 |
+| Schema migration with a data backfill and a copy-back assertion | 180 |
+| New module in `wamesk/*` (model, migration, Nova screen, policy, tests) | 300 |
+
+**Uncertainty is an open question, not a surcharge.** When you cannot size the
+work, you have found something the task does not say yet. Write that question
+into the task, estimate the investigation that answers it, and state in the
+reasoning what the fix costs under each likely answer. A number with a written
+assumption survives review. A number padded for "unknown unknowns" does not, and
+it hides the question that was worth asking.
+
+**Do not pad a task because it is labelled TBD**, and do not shrink a real
+multi-layer bug so the list looks cheap. Both errors cost the same trust.
+
+**Why this replaced the old rule.** Hand-written estimates used to run about
+twice the real cost, which lost us work we should have won. The first fix was a
+30–50 % speedup factor with a 15–30 % buffer on top — but that chain put the
+padding straight back while sounding rigorous, and it produced a 0.58×–0.91×
+band on every single task. The anchors above carry the same judgement as one
+number. The measured feedback loop is the `teamwork-tasks-from-session` plugin,
+which shows the methodology estimate and the real logged session time side by
+side. When those two drift apart on the same kind of work, change the anchors
+here — never re-introduce a buffer percentage.
 
 ---
 

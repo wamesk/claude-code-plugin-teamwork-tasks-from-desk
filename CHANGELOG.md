@@ -4,6 +4,46 @@ All notable changes to the `teamwork-tasks-from-desk` plugin are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-09-22
+
+### Changed
+- **Estimate methodology replaced — `wame-estimate-v2`.** The old rule produced a
+  "traditional" estimate, cut it by 30–50 % for Claude Code, then added a 15–30 %
+  buffer on top. Two percentages stacked on a guess give a 0.58×–0.91× band on
+  every task, so the same work could legitimately be quoted at 60 or at 95
+  minutes and the wider end always won the argument. The methodology now
+  estimates **one number directly** against a table of finished-outcome anchors.
+  The anchors are tighter (a single figure each, adjust by at most one 15-minute
+  step) and the block states explicitly what the number covers — reproduce,
+  implement, test, run the suite, self-review, one review round — and what it
+  never covers: deployment, production data fixes, client communication, and any
+  work behind an unanswered `[OTVORENÉ]` question.
+- **Uncertainty is now an open question, not a surcharge.** Where the old text
+  told you to pad for "unknown unknowns", the new one tells you to write the
+  question into the task, estimate the investigation that answers it, and state
+  what the fix costs under each answer.
+- **The 240-minute split threshold is now named as the working ceiling**, so it
+  no longer contradicts the 480-minute hard cap sitting in the same paragraph.
+- The methodology block is byte-identical across `teamwork-task-analyze`,
+  `teamwork-tasks-from-dnr`, `teamwork-tasks-from-desk`,
+  `teamwork-tasks-from-session` and `dnr-business`, and now carries a version
+  marker so a drifted copy is visible.
+- Step 5.4 no longer keeps a private copy of the methodology with its own anchor
+  table. It points at the shared `## WAME estimate methodology` block, which the
+  plugin now carries in full, and keeps only what is specific to this skill: the
+  rounding keys and the rule that a main task's estimate is the sum of its
+  subtasks.
+- Step 5.4 names the failure mode of this particular skill: a Desk ticket is
+  written by a customer, so it is usually short one fact you need in order to
+  size the work. That is an open question for Step 7, not a reason to round up.
+
+### Removed
+- Config keys `estimate.buffer_pct_min`, `estimate.buffer_pct_max`,
+  `estimate.speedup_pct_min` and `estimate.speedup_pct_max`. The config
+  migration deletes them from files written by earlier versions and renames
+  `methodology` from `wame_senior_claude_code` to `wame_estimate_v2` — a stale
+  `buffer_pct_max` left in the file reads like a rule somebody still follows.
+
 ## [1.0.2] — 2026-06-11
 
 Security and correctness hardening of the task-creation path. No user-facing

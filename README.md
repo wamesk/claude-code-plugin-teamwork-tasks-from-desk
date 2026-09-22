@@ -78,7 +78,7 @@ The skill then asks (via `AskUserQuestion`):
 5. **Asks for an assignee email per role** when the task splits — each role
    can be answered independently or left empty.
 6. **Estimates** via the WAME senior-engineer-with-Claude-Code methodology
-   (30–50 % speedup, 15–30 % buffer, 15 min step, 480 min cap per task).
+   (one number per task against the anchors, 15 min step, split above 240 min, 480 min cap).
 7. **Pauses with clarifying questions** via `AskUserQuestion` in batches of 4,
    max 6 per run; folds answers back into AC / Cieľ / Technický popis;
    preserves anything unresolved as `[OTVORENÉ]` markers.
