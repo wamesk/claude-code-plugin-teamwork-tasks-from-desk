@@ -11,7 +11,7 @@
     "description_format": "wame_canonical",
     "sections": {
       "preamble_label": "",
-      "preamble_strip_signatures": true,
+      "preamble_strip_signatures": false,
       "acceptance_label_sk": "Akceptačné kritériá",
       "acceptance_label_en": "Acceptance criteria",
       "goal_label_sk": "Cieľ",
@@ -63,6 +63,11 @@
         "png",
         "jpg",
         "jpeg",
+        "gif",
+        "webp",
+        "heic",
+        "bmp",
+        "tiff",
         "zip"
       ],
       "cleanup": "after_run"

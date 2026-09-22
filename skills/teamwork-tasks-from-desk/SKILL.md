@@ -200,7 +200,7 @@ jq '
 | .desk_skill.attachments                           //= {}
 | .desk_skill.attachments.attach_mode               //= "ask"
 | .desk_skill.attachments.max_attachment_size_mb    //= 25
-| .desk_skill.attachments.extensions_allow          //= ["md","txt","pdf","docx","xlsx","csv","json","html","eml","msg","sql","png","jpg","jpeg","zip"]
+| .desk_skill.attachments.extensions_allow          //= ["md","txt","pdf","docx","xlsx","csv","json","html","eml","msg","sql","png","jpg","jpeg","gif","webp","heic","bmp","tiff","zip"]
 | .desk_skill.attachments.cleanup                   //= "after_run"
 | .desk_skill.link_back                             //= {}
 | .desk_skill.link_back.try_native_desk_link        //= true
@@ -432,8 +432,13 @@ The `createdBy.type` distinguishes `customers` (the ticket reporter) from
 earliest `createdAt`. This is the source for the AC extraction in Step 5.
 
 **Markdown conversion:** convert each `htmlBody` to markdown — prefer
-`pandoc -f html -t markdown_strict`, fall back to `python -m html2text` or a
-`sed`-based stripper. Keep chronological order: earliest first.
+`pandoc -f html -t markdown_strict`, fall back to `python -m html2text`. Both
+keep `<img src="...">` as `![alt](src)`, and that is load-bearing: a screenshot
+pasted into a Desk message is only ever that one link, so a converter that drops
+the tag deletes the screenshot. A `sed`-based tag stripper is **not** an
+acceptable fallback for any body containing `<img` — if neither converter is
+installed, keep that body as raw HTML rather than stripping it. Keep
+chronological order: earliest first.
 
 **Agent identity resolution:** the team-side notes carry only
 `createdBy.id` referring to users. To label them (`agent Mário`, `Allcoo Bot`),
@@ -505,7 +510,11 @@ for FILE_ID in $FILE_IDS; do
   [ -z "$FILENAME" ] && FILENAME="file_${FILE_ID}"
 
   # Extension allow-list check
-  EXT="${FILENAME##*.}"; EXT="${EXT,,}"
+  # NOT ${EXT,,} — that is bash 4. macOS ships bash 3.2 and zsh answers
+  # "bad substitution", which aborts the whole download loop and loses EVERY
+  # attachment before the allow-list is even consulted. Same trap the tool-name
+  # note two pages below already documents for `declare -n`.
+  EXT="$(printf '%s' "${FILENAME##*.}" | tr '[:upper:]' '[:lower:]')"
   if ! printf '%s\n' "${ALLOW[@]}" | grep -qFx "$EXT"; then
     echo "⏭ ${FILENAME}: extension '${EXT}' blocked by config"
     rm -f "$TMP_PATH"
@@ -699,9 +708,17 @@ Examples:
 ### 5.2 — Description (canonical WAME format)
 
 ```
-[optional preamble — the customer's first email verbatim, kept when it carries
-context that would otherwise be lost; trim quoted signatures and legal
-footers]
+[preamble — the customer's first email VERBATIM. Include it whenever the ticket
+has a customer message; it is the reporter's own record and this task is the
+only place it survives. Keep its own wording, spelling and diacritics, and
+EVERY inline image unchanged. A screenshot pasted into a Desk message is an
+inline markdown link (`![image.png](https://tw-inlineimages.s3-accelerate.amazonaws.com/...)`,
+or a raw `<img src="...">`); it is not a separate attachment and it exists
+nowhere else, so dropping the link deletes the screenshot from the task. Never
+re-format, re-spell, translate, summarise or tidy the reporter's words — the
+preamble is a record, not a draft. The only removals allowed are the quoted
+reply chain and the legal footer, and only when the block being removed
+contains no image link, no `<img>` tag and no attachment reference]
 
 ---
 
@@ -772,8 +789,14 @@ there. Do not start from a "traditional" estimate and multiply it down; version
 2 removed the speedup factor and the risk buffer, and this skill must not keep a
 private copy of them.
 
-Two things are specific to this skill:
+Three things are specific to this skill:
 
+- **The number never goes into the task title or the task description.** It is
+  written exactly once, to the Teamwork estimate field (`estimatedMinutes` on
+  the POST — Steps 10 and 11). An estimate gets revised; a copy of it in the
+  prose has to be found and edited by hand, and the two then disagree. Showing
+  it in the Step 9 terminal preview, the Step 13 Desk internal note and the
+  Step 14 report is fine — none of those is the task record.
 - Round to `desk_skill.estimate.step_minutes` (15) and cap at
   `desk_skill.estimate.max_task_minutes` (480). Above
   `desk_skill.subtasks.propose_split_threshold_minutes` (240) the work splits via
@@ -1686,6 +1709,64 @@ When `cleanup == "keep"`, print the directory path so the user can inspect it.
 
 ---
 
+## Task record rules
+
+> Block version `wame-task-record-v1`. Shared **verbatim** across the plugins that write a Teamwork
+> task — `teamwork-task-analyze`, `teamwork-tasks-from-desk`, `teamwork-tasks-from-session` and
+> `teamwork-tasks-from-dnr`. Change it in all of them or in none.
+
+### The estimate lives in the estimate field, and nowhere else
+
+Never write minutes or hours into a task's **title** or **description**. Not in the preamble, not
+inside the technical plan, not as a footer line under it.
+
+The reason is maintenance, not taste. An estimate gets revised — after the first hour of work, after
+a clarifying answer comes back, after the task is split into subtasks. A number that also sits in
+prose has to be found and changed in every copy it was written to, and the copy somebody misses is
+the one the next reader believes. One field, one number, nothing to reconcile.
+
+This binds every surface that writes a task:
+
+- the description body, including any `**Odhad:** … min` or `**Estimate:** … min` line
+- the task title, including a `(120 min)` or `· 2h` suffix
+- the description column of a generated import file
+- a subtask's title and description, on the same terms as the parent
+
+Where the estimate belongs instead: the API estimate field — `estimateMinutes` on a v3 read,
+`estimatedMinutes` on a v3 create, `estimated-minutes` on the classic v1 update.
+
+Where it is still fine to show: the terminal preview, the confirmation gate, the final report, and
+any companion document that is not the task itself — a Desk internal note, a Markdown plan sitting
+next to an XLSX. Those are read once and thrown away. The task record is not.
+
+### Never lose what the reporter wrote
+
+When this skill rewrites an **existing** task description, everything already there survives
+**verbatim** at the top, above the first `---`.
+
+- **Inline images.** A screenshot pasted into a Teamwork description is ordinary Markdown:
+  `![image.png](https://tw-inlineimages.s3-accelerate.amazonaws.com/…)`. It is **not** a separate
+  attachment, and Teamwork shows it **nowhere else** — `GET /projects/api/v3/tasks/{id}/files.json`
+  returns nothing for it. Dropping that link deletes the screenshot from the task. This is not
+  hypothetical: one run stripped the image links out of 18 descriptions on the assumption that
+  Teamwork rendered them separately, and destroyed 25 screenshots. They came back only because the
+  original text happened to still be in a scratch file.
+- **The reporter's own wording, spelling and punctuation.** Do not add diacritics, do not fix
+  grammar, do not translate, do not tighten, do not re-order. A bug report is the record of what
+  somebody saw and how they described it. A tidied version is no longer that record, and the tester
+  cannot recognise their own report in it.
+- **Links, lists, line breaks, and any HTML that is already there.** Pass the block through
+  untouched.
+
+Before writing, read the current description. After composing the new one, check that the old text
+still occurs inside it character for character. When it does not, you are about to delete somebody's
+work — stop and ask the user instead of writing.
+
+Attachments and comments are separate records and this skill never touches them. If a change would
+need one removed, that is a question for the user, not a step in the plan.
+
+---
+
 ## WAME estimate methodology
 
 > Block version `wame-estimate-v2`. Shared **verbatim** across the plugins
@@ -1776,7 +1857,15 @@ here — never re-introduce a buffer percentage.
 - Never moves the new Projects task between board columns
 - Never logs time on the new Projects task
 - Never marks the new task or subtasks as complete
+- Never writes the estimate into the task title or the task description — the
+  Teamwork estimate field (`estimatedMinutes`) is its only home
 - Never runs `git commit`, `git push`, or any git command
+- Never drops an inline image, an `<img>` tag or an attachment reference out of
+  the customer's words when carrying them into the preamble — a screenshot
+  pasted into a Desk message IS a markdown image link and exists nowhere else,
+  so stripping the link deletes the screenshot
+- Never re-words, re-spells, translates or tidies the reporter's own text; the
+  preamble is a record, not a draft
 - Never overwrites an existing Projects task — running on the same Desk ticket
   twice will create a second task (idempotency detection is deferred to a
   future version; if you re-run, cancel at Step 9 and clean up manually)

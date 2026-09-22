@@ -4,6 +4,41 @@ All notable changes to the `teamwork-tasks-from-desk` plugin are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-09-22
+
+### Fixed
+- **`${EXT,,}` aborted the whole attachment download loop.** That is bash 4 syntax;
+  macOS ships bash 3.2 and answers `bad substitution`, as does zsh. The failure is total,
+  not partial: every attachment the customer sent — every screenshot — was lost before
+  the allow-list was even consulted. The file already knew about this trap; two pages
+  later it deliberately avoids `declare -n` for the same reason. Now uses a portable
+  `tr`.
+- **The attachment allow-list dropped ordinary screenshot formats.** `png`, `jpg` and
+  `jpeg` only means a `.gif` screen recording, a `.webp` screenshot or an iPhone `.heic`
+  photo is downloaded, deleted and never reaches the task. Widened in both the Step 2.5
+  merge block and `config.example.json`, which seeds a first-run config that `//=` then
+  leaves alone forever — both copies needed it or the fix was half applied.
+- **The customer's own words were droppable and trimmable.** Step 5.2 called the preamble
+  `optional`, kept it only "when it carries context that would otherwise be lost", and
+  told the skill to trim trailing blocks — which is exactly where a pasted screenshot
+  sits in an email reply. The `sed`-based HTML stripper offered as an equal third
+  conversion option removed every tag including `<img>`.
+- `preamble_strip_signatures` in `config.example.json` was a dead key nothing reads,
+  shipping `true` to every new user as if it were policy.
+
+### Changed
+- **Two new rules, shared verbatim as the `wame-task-record-v1` block.**
+  1. *The estimate lives in the estimate field, and nowhere else.* Minutes never go
+     into a task title or description — not in the preamble, not in the technical
+     plan, not as a footer line. An estimate gets revised, and a number duplicated
+     into prose has to be changed in every copy; the copy somebody misses is the one
+     the next reader believes. Previews, confirmation gates, final reports and
+     companion documents may still show it — those are read once and thrown away.
+  2. *Never lose what the reporter wrote.* When an existing description is rewritten,
+     everything already there survives verbatim at the top: inline images, links, the
+     reporter's own wording, spelling and punctuation. No diacritics added, no grammar
+     fixed, no translation, no tidying.
+
 ## [1.1.0] — 2026-09-22
 
 ### Changed
