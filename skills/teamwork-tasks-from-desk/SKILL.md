@@ -44,6 +44,37 @@ The only writes are:
 
 ---
 
+## Shell portability contract
+
+Every bash snippet below runs in the user's login shell: **zsh on macOS** (that is
+what Claude Code's Bash tool starts there), bash elsewhere. Each Bash tool call is
+a **fresh shell** — variables and functions do not survive into the next call.
+Future edits must keep these rules, because every one of them has already failed
+silently somewhere in the Teamwork plugin family:
+
+- **JSON goes to `jq` on stdin via a here-string** — `jq … <<<"$JSON"` or
+  `printf '%s\n' "$JSON" | jq …`. Never `echo "$JSON" | jq`: zsh's `echo` expands
+  `\n`, `\t`, `\\` inside the JSON and jq rejects the whole response.
+- **Line lists are read with `while IFS= read -r X; do …; done <<<"$LIST"`.** An
+  unquoted `for X in $LIST` iterates exactly once in zsh (no word splitting) —
+  that is how every attachment id once became one malformed URL.
+- **No bash-only expansions:** `${!ARR[@]}`, `${!name}`, `${X@Q}`, `${X,,}` all
+  answer `bad substitution` in zsh (and the last two in macOS bash 3.2). zsh arrays
+  are 1-based — read an element with the slice `${ARR[@]:$i:1}`, never `${ARR[$i]}`;
+  indirect reads go through `eval "V=\${$name:-}"`.
+- **`[ "$a" = "$b" ]`** — a single `=`; `==` inside `[ ]` fails in zsh.
+- **No bare globs that may not match** — zsh aborts with `no matches found`; use
+  `find`. Quote every URL (they contain `?` and `&`) and every word starting with `=`.
+- **Every API call checks its HTTP status** (`-w '%{http_code}'`). A failed call or
+  parse prints a `⚠`/`❌` line naming the endpoint and the fallback the run takes —
+  never `2>/dev/null || echo 0` or `|| true`, which turn an error into "nothing there".
+- **A function is defined in the same Bash call that uses it.** `desk_curl` is not
+  global: every Bash call that talks to Desk starts with the *Desk call preamble*
+  from Step 2.6. Untrusted text reaches Python through a temp file, argv or stdin,
+  never spliced into Python source.
+
+---
+
 ## Arguments
 
 Expected first positional argument: a **Teamwork Desk ticket URL** of the form
@@ -101,11 +132,13 @@ gymnastics on macOS, and the ISO string is human-readable in the final report.
 ```bash
 RUN_START_EPOCH=$(date -u +%s)
 RUN_START_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+echo "RUN_START_EPOCH=${RUN_START_EPOCH} RUN_START_ISO=${RUN_START_ISO}"
 ```
 
-These two variables are referenced once more in Step 14. Do **not** try to make
-them session-global / exported — `bash` subshells in pipeline stages would lose
-them. Keep them as plain shell variables in the top scope of the run.
+These two values are referenced once more in Step 14. Every Bash tool call is a
+fresh shell (see the Shell portability contract), so they do **not** survive
+until then on their own — re-declare both, literally from the line printed
+above, at the top of the Step 14.1 call.
 
 ---
 
@@ -178,7 +211,7 @@ jq '
 | .desk_skill.sections.hr_marker                    //= "---"
 | .desk_skill.estimate                              //= {}
 | .desk_skill.estimate.methodology                  //= "wame_estimate_v2"
-| .desk_skill.estimate.set_if_missing               //= true
+| .desk_skill.estimate.set_if_missing               |= (if . == null then true else . end)
 | .desk_skill.estimate.step_minutes                 //= 15
 | .desk_skill.estimate.max_task_minutes             //= 480
 # v2 estimates one number directly — the speedup/buffer multipliers are gone.
@@ -189,37 +222,37 @@ jq '
 | (if .desk_skill.estimate.methodology == "wame_senior_claude_code"
    then .desk_skill.estimate.methodology = "wame_estimate_v2" else . end)
 | .desk_skill.subtasks                              //= {}
-| .desk_skill.subtasks.enabled                      //= true
+| .desk_skill.subtasks.enabled                      |= (if . == null then true else . end)
 | .desk_skill.subtasks.propose_split_threshold_minutes //= 240
 | .desk_skill.subtasks.min_split_subtasks           //= 2
 | .desk_skill.subtasks.max_split_subtasks           //= 6
 | .desk_skill.subtasks.role_prefixes                //= ["BE","FE","QA","Migration","DevOps"]
 | .desk_skill.assignee                              //= {}
-| .desk_skill.assignee.ask_per_role                 //= true
-| .desk_skill.assignee.allow_empty                  //= true
+| .desk_skill.assignee.ask_per_role                 |= (if . == null then true else . end)
+| .desk_skill.assignee.allow_empty                  |= (if . == null then true else . end)
 | .desk_skill.attachments                           //= {}
 | .desk_skill.attachments.attach_mode               //= "ask"
 | .desk_skill.attachments.max_attachment_size_mb    //= 25
 | .desk_skill.attachments.extensions_allow          //= ["md","txt","pdf","docx","xlsx","csv","json","html","eml","msg","sql","png","jpg","jpeg","gif","webp","heic","bmp","tiff","zip"]
 | .desk_skill.attachments.cleanup                   //= "after_run"
 | .desk_skill.link_back                             //= {}
-| .desk_skill.link_back.try_native_desk_link        //= true
-| .desk_skill.link_back.url_in_description_footer   //= true
+| .desk_skill.link_back.try_native_desk_link        |= (if . == null then true else . end)
+| .desk_skill.link_back.url_in_description_footer   |= (if . == null then true else . end)
 | .desk_skill.link_back.notify_desk_default         //= "ask"
-| .desk_skill.link_back.notify_desk_include_summary //= true
+| .desk_skill.link_back.notify_desk_include_summary |= (if . == null then true else . end)
 | .desk_skill.customer_reply_draft                  //= {}
-| .desk_skill.customer_reply_draft.enabled          //= true
+| .desk_skill.customer_reply_draft.enabled          |= (if . == null then true else . end)
 | .desk_skill.customer_reply_draft.ask_default      //= "ask"
 | .desk_skill.customer_reply_draft.tone             //= "formal"
 | .desk_skill.customer_reply_draft.language_detection //= "from_ticket"
 | .desk_skill.customer_reply_draft.language_fallback //= "sk"
 | .desk_skill.customer_reply_draft.signature        //= "S pozdravom,\nTím WAME"
-| .desk_skill.customer_reply_draft.include_open_questions //= true
-| .desk_skill.customer_reply_draft.post_as_internal_note //= true
-| .desk_skill.customer_reply_draft.never_send_as_reply //= true
+| .desk_skill.customer_reply_draft.include_open_questions |= (if . == null then true else . end)
+| .desk_skill.customer_reply_draft.post_as_internal_note |= (if . == null then true else . end)
+| .desk_skill.customer_reply_draft.never_send_as_reply |= (if . == null then true else . end)
 | .desk_skill.clarifying_questions                  //= {}
 | .desk_skill.clarifying_questions.max_per_run      //= 6
-| .desk_skill.clarifying_questions.fold_into_description //= true
+| .desk_skill.clarifying_questions.fold_into_description |= (if . == null then true else . end)
 | .desk_skill.clarifying_questions.leave_unresolved_as_open_marker //= "[OTVORENÉ]"
 | .desk_skill.auth_scheme                           //= ""
 | .desk_skill.note_payload_shape                    //= ""
@@ -229,7 +262,7 @@ jq '
 | .desk_skill.attachment_attach_endpoint            //= ""
 | .desk_skill.file_download_endpoint                //= ""
 | .desk_skill.timing                                //= {}
-| .desk_skill.timing.report_run_duration            //= true
+| .desk_skill.timing.report_run_duration            |= (if . == null then true else . end)
 | .desk_skill.timing.duration_format                //= "human"
 ' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE" && chmod 600 "$CONFIG_FILE"
 ```
@@ -267,7 +300,7 @@ Load all values into local variables for the rest of the run:
 PROJECTS_TOKEN=$(jq -r '.teamwork.api_token'  "$CONFIG_FILE")
 DESK_TOKEN=$(   jq -r '.teamwork.desk_token'  "$CONFIG_FILE")
 BASE_URL=$(     jq -r '.teamwork.base_url'    "$CONFIG_FILE")
-DESK_BASE=$(    jq -r '(.teamwork.desk_base_url // "") | if . == "" then "'"$BASE_URL"'/desk" else . end' "$CONFIG_FILE")
+DESK_BASE=$(    jq -r --arg b "$BASE_URL" '(.teamwork.desk_base_url // "") | if . == "" then $b + "/desk" else . end' "$CONFIG_FILE")
 PROJECTS_AUTH="${PROJECTS_TOKEN}:xxx"     # Basic auth for Projects (always)
 ```
 
@@ -319,21 +352,39 @@ fi
 ```
 
 Build a single `desk_curl` helper used by every subsequent Desk API call so the
-auth scheme is applied transparently and never duplicated:
+auth scheme is applied transparently and never duplicated.
+
+**Desk call preamble.** Each Bash tool call is a fresh shell, so a function
+defined here does not exist in Step 3's call — calling it there fails with
+`command not found`, the status variable comes back empty, and the run reads
+that as "no thread, no attachments". Paste this block at the top of **every**
+Bash call that uses `desk_curl` (Steps 3, 3.1, 3.2, 3.3, 13.2, 13b). It reloads
+the token and the scheme from the config (persisted just above), so it never
+needs a value from an earlier call and never prints the token:
 
 ```bash
+# --- Desk call preamble (same Bash call as every desk_curl use) --------------
+CONFIG_FILE="$HOME/.claude/plugins/data/teamwork-task-wamesk/config.json"
+DESK_TOKEN=$(jq -r '.teamwork.desk_token' "$CONFIG_FILE")
+DESK_AUTH_SCHEME=$(jq -r '.desk_skill.auth_scheme // ""' "$CONFIG_FILE")
+BASE_URL=$(jq -r '.teamwork.base_url' "$CONFIG_FILE")
+DESK_BASE=$(jq -r --arg b "$BASE_URL" '(.teamwork.desk_base_url // "") | if . == "" then $b + "/desk" else . end' "$CONFIG_FILE")
+DESK_API="${DESK_BASE}/api/$(jq -r '.desk_skill.api_version // "v2"' "$CONFIG_FILE")"
 desk_curl() {
   # Usage: desk_curl <curl-args...>
   # Adds the correct auth header/flag based on $DESK_AUTH_SCHEME.
   case "$DESK_AUTH_SCHEME" in
     bearer) curl -sS -H "Authorization: Bearer $DESK_TOKEN" "$@" ;;
     basic)  curl -sS -u "${DESK_TOKEN}:xxx" "$@" ;;
+    *)      echo "❌ desk_curl: no Desk auth scheme in config — run Step 2.6 first" >&2; return 1 ;;
   esac
 }
+# ------------------------------------------------------------------------------
 ```
 
 From this point onward in the document, replace every `curl -sS -u "$DESK_AUTH" …`
-or `-H "Authorization: Bearer …"` invocation with `desk_curl …`.
+or `-H "Authorization: Bearer …"` invocation with `desk_curl …`, preceded by the
+preamble in the same call.
 
 ---
 
@@ -344,6 +395,7 @@ may be `/desk/api/v1/`. The skill probes v2 first and falls back gracefully,
 recording the working version into the config for subsequent runs:
 
 ```bash
+# (Desk call preamble from Step 2.6 goes here — same Bash call.)
 DESK_API_VERSION=$(jq -r '.desk_skill.api_version // ""' "$CONFIG_FILE")
 if [ -z "$DESK_API_VERSION" ]; then
   for V in v2 v1; do
@@ -364,8 +416,15 @@ DESK_API="${DESK_BASE}/api/${DESK_API_VERSION}"
 ### Step 3.1 — Ticket details (subject, customer, inbox)
 
 ```bash
-TICKET_JSON=$(desk_curl \
+# (Desk call preamble from Step 2.6 goes here — same Bash call.)
+RESP=$(desk_curl -H "Accept: application/json" -w '\n%{http_code}' \
   "${DESK_API}/tickets/${TICKET_ID}.json?include=customer,inbox,assignee")
+HTTP=${RESP##*$'\n'}; TICKET_JSON=${RESP%$'\n'*}
+case "$HTTP" in
+  200) ;;
+  401) echo "❌ Desk ticket → HTTP 401 — the Desk token was rejected; re-run the Step 2 first-run prompt" >&2; exit 1 ;;
+  *)   echo "❌ GET ${DESK_API}/tickets/${TICKET_ID}.json → HTTP $HTTP — stopping" >&2; exit 1 ;;
+esac
 ```
 
 **Note on `?include=`** — v2 may return an empty `included: []` even when the
@@ -374,28 +433,47 @@ include parameter is accepted (workspace-tier dependent). The skill must
 If they are empty, fetch each by id separately:
 
 ```bash
+# Same Bash call as the ticket GET above — it needs $TICKET_JSON and desk_curl.
 CUSTOMER_ID=$(jq -r '.ticket.customer.id // .customer.id // empty' <<<"$TICKET_JSON")
 INBOX_ID=$(   jq -r '.ticket.inbox.id    // .inbox.id    // empty' <<<"$TICKET_JSON")
 
 if [ -n "$CUSTOMER_ID" ] && [ "$(jq -r '.included.customers // {} | length' <<<"$TICKET_JSON")" = "0" ]; then
-  CUSTOMER_JSON=$(desk_curl "${DESK_API}/customers/${CUSTOMER_ID}.json")
+  RESP=$(desk_curl -w '\n%{http_code}' "${DESK_API}/customers/${CUSTOMER_ID}.json")
+  HTTP=${RESP##*$'\n'}; CUSTOMER_JSON=${RESP%$'\n'*}
+  [ "$HTTP" = "200" ] || { echo "⚠ GET customers/${CUSTOMER_ID}.json → HTTP $HTTP — customer name/email left blank" >&2; CUSTOMER_JSON='{}'; }
 fi
 if [ -n "$INBOX_ID" ] && [ "$(jq -r '.included.inboxes // {} | length' <<<"$TICKET_JSON")" = "0" ]; then
-  INBOX_JSON=$(desk_curl "${DESK_API}/inboxes/${INBOX_ID}.json")
+  RESP=$(desk_curl -w '\n%{http_code}' "${DESK_API}/inboxes/${INBOX_ID}.json")
+  HTTP=${RESP##*$'\n'}; INBOX_JSON=${RESP%$'\n'*}
+  [ "$HTTP" = "200" ] || { echo "⚠ GET inboxes/${INBOX_ID}.json → HTTP $HTTP — inbox name left blank" >&2; INBOX_JSON='{}'; }
 fi
 ```
 
-Extract:
+Extract (same Bash call again). On Desk v2, `.ticket.customer` and
+`.ticket.inbox` are only `{id, type}` references — no name, no email (verified
+2026-09-24 on a live ticket). The full objects live in `included` when the tier
+fills it, otherwise in `CUSTOMER_JSON` / `INBOX_JSON` fetched just above. Until
+1.3.0 only the reference was read, so the customer and the inbox were blank on
+every run — in `### Zdroj`, in the preview and in the reply salutation.
 
 ```bash
-SUBJECT=$(   jq -r '.ticket.subject     // .subject     // "(no subject)"'           <<<"$TICKET_JSON")
-CUSTOMER_FN=$(jq -r '(.ticket.customer  // .customer    // {}).firstName // ""'      <<<"$TICKET_JSON")
-CUSTOMER_LN=$(jq -r '(.ticket.customer  // .customer    // {}).lastName  // ""'      <<<"$TICKET_JSON")
-CUSTOMER_EMAIL=$(jq -r '
-  (((.ticket.customer // .customer // {}).emailAddresses // []) | .[0].address)
-  // ((.ticket.customer // .customer // {}).email)
-  // ""' <<<"$TICKET_JSON")
-INBOX_NAME=$(jq -r '(.ticket.inbox // .inbox // {}).name // ""' <<<"$TICKET_JSON")
+# Full object: included → the lookup above → an embedded object (older tiers).
+CUSTOMER_OBJ=$(jq -c --arg id "$CUSTOMER_ID" '
+  [ (.included // {}) | objects | (.customers // []) | .[]? | select((.id|tostring) == $id) ][0]
+  // (.ticket.customer // .customer // {})' <<<"$TICKET_JSON")
+[ -n "${CUSTOMER_JSON:-}" ] && CUSTOMER_OBJ=$(jq -c '.customer // {}' <<<"$CUSTOMER_JSON")
+INBOX_OBJ=$(jq -c --arg id "$INBOX_ID" '
+  [ (.included // {}) | objects | (.inboxes // []) | .[]? | select((.id|tostring) == $id) ][0]
+  // (.ticket.inbox // .inbox // {})' <<<"$TICKET_JSON")
+[ -n "${INBOX_JSON:-}" ] && INBOX_OBJ=$(jq -c '.inbox // {}' <<<"$INBOX_JSON")
+
+SUBJECT=$(    jq -r '.ticket.subject // .subject // "(no subject)"' <<<"$TICKET_JSON")
+CUSTOMER_FN=$(jq -r '.firstName // ""' <<<"$CUSTOMER_OBJ")
+CUSTOMER_LN=$(jq -r '.lastName  // ""' <<<"$CUSTOMER_OBJ")
+CUSTOMER_EMAIL=$(jq -r '((.emailAddresses // []) | .[0].address) // .email // ""' <<<"$CUSTOMER_OBJ")
+INBOX_NAME=$( jq -r '.name // ""' <<<"$INBOX_OBJ")
+[ -n "${CUSTOMER_FN}${CUSTOMER_LN}${CUSTOMER_EMAIL}" ] \
+  || echo "⚠ customer #${CUSTOMER_ID:-?}: no name or e-mail found — the Customer line in ### Zdroj stays blank" >&2
 ```
 
 If HTTP 401 → re-prompt the Desk token (re-run Step 2 first-run flow). 403/404
@@ -403,10 +481,17 @@ If HTTP 401 → re-prompt the Desk token (re-run Step 2 first-run flow). 403/404
 
 ### Step 3.2 — Chronological thread
 
-Try `/threads.json` first (older shape); on 404 fall back to `/messages.json`
-(modern Desk workspaces — what the v2 path actually exposes):
+Try `/threads.json` first (older shape); on any non-200 fall back to
+`/messages.json` (modern Desk workspaces — what the v2 path actually exposes).
+The fallback is the **normal** path: on the WAME workspace `/threads.json`
+answers `403 "You Must Upgrade Your Account"` while `/messages.json` answers 200
+in chronological order (verified 2026-09-24). Keep both — but check the
+fallback's status too. Until 1.3.0 it did not, so a failed `/messages.json`
+left an error body in `/tmp/threads.json`, `(.messages // .threads // [])` read
+it as an empty thread, and the task was drafted without a single customer word.
 
 ```bash
+# (Desk call preamble from Step 2.6 goes here — same Bash call.)
 THREADS_URL="${DESK_API}/tickets/${TICKET_ID}/threads.json?page=1&pageSize=100&orderBy=createdAt&orderMode=asc"
 HTTP=$(desk_curl -o /tmp/threads.json -w '%{http_code}' "$THREADS_URL")
 
@@ -415,14 +500,45 @@ if [ "$HTTP" != "200" ]; then
   # `messages[]` instead of `threads[]` and `threadType` enum instead of
   # `channel`. Both schemes carry an `htmlBody`/`textBody` per item.
   THREADS_URL="${DESK_API}/tickets/${TICKET_ID}/messages.json?page=1&pageSize=100&orderBy=createdAt&orderMode=asc"
-  desk_curl -o /tmp/threads.json "$THREADS_URL"
+  HTTP=$(desk_curl -o /tmp/threads.json -w '%{http_code}' "$THREADS_URL")
+  if [ "$HTTP" != "200" ]; then
+    echo "❌ GET $THREADS_URL → HTTP $HTTP: $(jq -r '.errors[0].detail // .message // empty' /tmp/threads.json 2>/dev/null)" >&2
+    echo "   The ticket thread is unreadable — stopping rather than drafting a task from an empty thread." >&2
+    exit 1
+  fi
 fi
+if ! jq -e '(.messages // .threads) | type == "array"' /tmp/threads.json >/dev/null 2>&1; then
+  echo "❌ $THREADS_URL → HTTP 200 but no messages[] / threads[] array in the body — stopping" >&2
+  exit 1
+fi
+
+# Page through. pageSize=100 is a cap, not the thread length: without this loop
+# a ticket with more than 100 items silently lost its newest messages and their
+# attachments. Pages 2..N are appended into /tmp/threads.json.
+PAGES=$(jq -r '.meta.page.pages // .pagination.pages // .meta.totalPages // 1' /tmp/threads.json)
+THREADS_PATH=${THREADS_URL%%\?*}
+P=2
+while [ "$P" -le "$PAGES" ]; do
+  PAGE_URL="${THREADS_PATH}?page=${P}&pageSize=100&orderBy=createdAt&orderMode=asc"
+  HTTP=$(desk_curl -o /tmp/threads_page.json -w '%{http_code}' "$PAGE_URL")
+  if [ "$HTTP" != "200" ]; then
+    echo "❌ GET $PAGE_URL → HTTP $HTTP — the thread would be incomplete; stopping" >&2
+    exit 1
+  fi
+  jq -s '.[0] as $a | .[1] as $b
+    | if ($a.messages | type) == "array" then $a | .messages += ($b.messages // [])
+      else $a | .threads += ($b.threads // []) end' \
+    /tmp/threads.json /tmp/threads_page.json > /tmp/threads_merged.json \
+    && mv /tmp/threads_merged.json /tmp/threads.json \
+    || { echo "❌ could not merge page $P of the thread — stopping" >&2; exit 1; }
+  P=$((P + 1))
+done
+echo "Desk thread: $(jq '(.messages // .threads) | length' /tmp/threads.json) item(s) on ${PAGES} page(s)"
 
 THREADS=$(cat /tmp/threads.json)
 ```
 
-Page through if `pagination.pages > 1` (older: `meta.totalPages`). Item array
-key is whichever of `threads[]` or `messages[]` is present. For each item
+Item array key is whichever of `threads[]` or `messages[]` is present. For each item
 collect: `id`, `htmlBody`, `textBody`, `createdAt`, `createdBy.id`,
 `threadType` (one of `message`, `note`, `eventInfo`), `files[]`.
 
@@ -461,12 +577,18 @@ Do not rely on them for either listing or metadata.
 FILE_IDS=$(jq -r '
   (.messages // .threads // []) | .[]?.files // [] | .[]?.id
 ' /tmp/threads.json | sort -u)
+echo "Attachments referenced in the thread: $(printf '%s\n' "$FILE_IDS" | grep -c .)"
 ```
 
 For each `file_id`, attempt the **download endpoint with the 303-follow
 trick** (works on the gated tier where the metadata endpoint does not):
 
 ```bash
+# (Desk call preamble from Step 2.6 goes here — same Bash call.)
+# Re-derive the id list: this is its own Bash call, where the FILE_IDS of the
+# snippet above no longer exists — the loop would run zero times and the run
+# would read that as "no attachments".
+FILE_IDS=$(jq -r '(.messages // .threads // []) | .[]?.files // [] | .[]?.id' /tmp/threads.json | sort -u)
 RUN_ID="$(date +%s)-${RANDOM}"
 ATT_DIR="${TMPDIR:-/tmp}/teamwork-tasks-from-desk-${RUN_ID}/attachments"
 mkdir -p "$ATT_DIR"
@@ -474,14 +596,34 @@ mkdir -p "$ATT_DIR"
 MAX_MB=$(jq -r '.desk_skill.attachments.max_attachment_size_mb' "$CONFIG_FILE")
 ALLOW=( $(jq -r '.desk_skill.attachments.extensions_allow[]' "$CONFIG_FILE") )
 
-for FILE_ID in $FILE_IDS; do
+# One id per line. NOT `for FILE_ID in $FILE_IDS` — zsh does not word-split an
+# unquoted variable, so that loop ran once with every id glued together by
+# newlines, requested one malformed URL, and lost every attachment.
+while IFS= read -r FILE_ID; do
+  [ -n "$FILE_ID" ] || continue
   # ★ The working download endpoint (returns 303 → signed S3 URL):
   #   GET ${DESK_API}/files/${FILE_ID}/download.json
   # NOT ${DESK_API}/files/${FILE_ID}.json   ← 403 on gated tiers
   # NOT ${DESK_API}/tickets/${TICKET_ID}/attachments.json  ← 403 on gated tiers
   TMP_PATH="${ATT_DIR}/_pending_${FILE_ID}"
-  HTTP=$(desk_curl -L -o "$TMP_PATH" -w '%{http_code}' \
+  HDR_PATH="${ATT_DIR}/_headers_${FILE_ID}"
+  # -D keeps the response headers of every hop of THIS GET — the filename is
+  # read from them below.
+  HTTP=$(desk_curl -L -D "$HDR_PATH" -o "$TMP_PATH" -w '%{http_code}' \
     "${DESK_API}/files/${FILE_ID}/download.json")
+
+  # Real filename from the S3 Content-Disposition of the same GET. NOT a second
+  # `desk_curl -I` request: the download endpoint answers HEAD with 403
+  # (verified 2026-09-24), so every file came out as `file_<id>`, had no
+  # extension, and the allow-list below rejected every attachment.
+  FILENAME="$(grep -i '^content-disposition' "$HDR_PATH" 2>/dev/null \
+    | sed -nE 's/.*filename="?([^";]+)"?.*/\1/p' \
+    | tr -d '\r' | tail -1)"
+  rm -f "$HDR_PATH"
+  FILENAME="${FILENAME##*/}"                       # never a path from a header
+  [ -z "$FILENAME" ] && FILENAME="file_${FILE_ID}"
+  # Mail clients reuse names (image001.png in every e-mail) — never overwrite.
+  [ -e "${ATT_DIR}/${FILENAME}" ] && FILENAME="${FILE_ID}_${FILENAME}"
 
   if [ "$HTTP" != "200" ]; then
     ATTACHMENT_FAILURES+=("file_${FILE_ID}: download HTTP ${HTTP}")
@@ -500,15 +642,6 @@ for FILE_ID in $FILE_IDS; do
     continue
   fi
 
-  # Sniff the real filename from the (S3) Content-Disposition header.
-  # Fallback: probe the .eml first message body (contains "File:  XXX")
-  # or use file_${FILE_ID} as a last resort.
-  FILENAME="$(desk_curl -I -L "${DESK_API}/files/${FILE_ID}/download.json" \
-    | grep -i 'content-disposition' \
-    | sed -nE 's/.*filename="?([^"]+)"?.*/\1/p' \
-    | tr -d '\r' | head -1)"
-  [ -z "$FILENAME" ] && FILENAME="file_${FILE_ID}"
-
   # Extension allow-list check
   # NOT ${EXT,,} — that is bash 4. macOS ships bash 3.2 and zsh answers
   # "bad substitution", which aborts the whole download loop and loses EVERY
@@ -522,7 +655,7 @@ for FILE_ID in $FILE_IDS; do
   fi
 
   mv "$TMP_PATH" "${ATT_DIR}/${FILENAME}"
-done
+done <<<"$FILE_IDS"
 ```
 
 Persist the working file-download endpoint on first success:
@@ -536,10 +669,15 @@ For binary documents (PDF/DOCX/XLSX/PPTX), also extract text into a sibling
 `.txt` so the Step 5 reasoning can see the content:
 
 ```bash
+# A failed extraction is non-fatal but never silent: say which file Step 5 has
+# to reason about without its text.
 case "$EXT" in
-  pdf)  pdftotext -layout "$F" "${F%.pdf}.txt"  2>/dev/null || true ;;
-  docx) pandoc -f docx -t plain "$F" -o "${F%.docx}.txt" 2>/dev/null || true ;;
-  xlsx) python3 - "$F" > "${F%.xlsx}.txt" 2>/dev/null <<'PY' || true
+  pdf)  pdftotext -layout "$F" "${F%.pdf}.txt" 2>/dev/null \
+          || echo "⚠ no text extracted from $(basename "$F") (pdftotext missing or failed) — Step 5 works without it" >&2 ;;
+  docx) pandoc -f docx -t plain "$F" -o "${F%.docx}.txt" 2>/dev/null \
+          || echo "⚠ no text extracted from $(basename "$F") (pandoc missing or failed) — Step 5 works without it" >&2 ;;
+  xlsx) python3 - "$F" > "${F%.xlsx}.txt" 2>/dev/null <<'PY' \
+          || echo "⚠ no text extracted from $(basename "$F") (xlsx parse failed) — Step 5 works without it" >&2
 # Pure-stdlib XLSX -> TSV text extractor (no openpyxl/pandas needed).
 # An .xlsx is a zip of XML parts: shared strings live in sharedStrings.xml,
 # cell values in xl/worksheets/sheetN.xml. We resolve shared-string indices
@@ -619,7 +757,8 @@ PY
 esac
 ```
 
-Failures are non-fatal — Step 5 simply works without that file's content.
+Failures are non-fatal — Step 5 works without that file's content, and the
+`⚠` line says so; list those files in the Step 9 preview.
 
 Cleanup mode `desk_skill.attachments.cleanup`:
 
@@ -648,8 +787,15 @@ PROJ_ENTITY_ID=$(echo "$PROJECTS_URL" | sed -nE 's|.*/(projects|tasklists)/([0-9
 ### Step 4.1 — Project URL flow
 
 ```bash
-GET ${BASE_URL}/projects/api/v3/projects/${PROJ_ENTITY_ID}.json
-GET ${BASE_URL}/projects/api/v3/projects/${PROJ_ENTITY_ID}/tasklists.json
+RESP=$(curl -sS -u "$PROJECTS_AUTH" -H "Accept: application/json" -w '\n%{http_code}' \
+  "${BASE_URL}/projects/api/v3/projects/${PROJ_ENTITY_ID}.json")
+HTTP=${RESP##*$'\n'}; PROJECT_JSON=${RESP%$'\n'*}
+[ "$HTTP" = "200" ] || { echo "❌ GET projects/${PROJ_ENTITY_ID}.json → HTTP $HTTP — no access or wrong URL; stopping" >&2; exit 1; }
+
+RESP=$(curl -sS -u "$PROJECTS_AUTH" -H "Accept: application/json" -w '\n%{http_code}' \
+  "${BASE_URL}/projects/api/v3/projects/${PROJ_ENTITY_ID}/tasklists.json?pageSize=100")
+HTTP=${RESP##*$'\n'}; TASKLISTS_JSON=${RESP%$'\n'*}
+[ "$HTTP" = "200" ] || { echo "❌ GET projects/${PROJ_ENTITY_ID}/tasklists.json → HTTP $HTTP — cannot list tasklists; stopping" >&2; exit 1; }
 ```
 
 If the project has exactly one tasklist → use it without asking.
@@ -670,14 +816,25 @@ TASKLIST_NAME="${selected_name}"
 
 ### Step 4.2 — Tasklist URL flow
 
+The v3 tasklist object carries `projectId` directly, but `.tasklist.project` is
+only an `{id, type}` reference — there is **no** `project.name` in it. The name
+exists only under `.included.projects["<id>"]`, so ask for `?include=projects`
+(verified 2026-09-24 on tasklist 3361804 → project 700336 "eTabletka").
+
 ```bash
-GET ${BASE_URL}/projects/api/v3/tasklists/${PROJ_ENTITY_ID}.json
+RESP=$(curl -sS -u "$PROJECTS_AUTH" -H "Accept: application/json" -w '\n%{http_code}' \
+  "${BASE_URL}/projects/api/v3/tasklists/${PROJ_ENTITY_ID}.json?include=projects")
+HTTP=${RESP##*$'\n'}; TL_JSON=${RESP%$'\n'*}
+if [ "$HTTP" != "200" ]; then
+  # A completed tasklist answers 404 too — ask for an active one.
+  echo "❌ GET tasklists/${PROJ_ENTITY_ID}.json → HTTP $HTTP — no access, wrong URL, or a completed tasklist; stopping" >&2
+  exit 1
+fi
+TASKLIST_ID="$PROJ_ENTITY_ID"
+TASKLIST_NAME=$(jq -r '.tasklist.name // ""' <<<"$TL_JSON")
+PROJECT_ID=$(   jq -r '.tasklist.projectId // .tasklist.project.id // empty' <<<"$TL_JSON")
+PROJECT_NAME=$( jq -r --arg p "$PROJECT_ID" '(.included.projects // {})[$p].name // ""' <<<"$TL_JSON")
 ```
-
-Extract `project.id` and `project.name` from the response to set `PROJECT_ID`
-and `PROJECT_NAME`. `TASKLIST_ID` = `PROJ_ENTITY_ID`.
-
-Stop with a clear error if the user cannot access the target (HTTP 403/404).
 
 ---
 
@@ -689,7 +846,8 @@ This is the reasoning step. Inputs:
 - Chronological threads (markdown bodies + author + channel + isInternal)
 - All downloaded attachment files + their extracted `.txt` sidecars
 - Repo shape sniff (only when running inside a Laravel/Vue/etc. repo) —
-  `composer.json` name, `package.json` name, `wamesk/*` modules, `Modules/*`
+  `composer.json` name, `package.json` name, `wamesk/*` modules, `Modules/*`,
+  and the installed framework / language versions (Step 5.2b)
 - Language from `--language` → `desk_skill.default_language` → `sk`
 
 Produce a draft with:
@@ -726,6 +884,10 @@ contains no image link, no `<img>` tag and no attachment reference]
 - [ ] AC 1 — atomic, testable, written from the user's perspective
 - [ ] AC 2 — …
 
+### Prierezové požiadavky
+- [ ] **Dostupnosť (reachability):** … (only the dimensions that apply — Step 5.2a)
+- [ ] **Bezpečnosť (security):** …
+
 ---
 
 ## Cieľ
@@ -747,6 +909,14 @@ Tables/columns/migrations or "none".
 ### Edge cases & risks
 Specifically the ones the customer hinted at in the thread.
 
+### Kvalita (UI/UX, výkon, bezpečnosť, dostupnosť, framework)
+One line of *how* per applicable dimension (Step 5.2a) — where the menu entry and
+the inbound link go, which policy guards the new action, which eager-load /
+index / pagination keeps the list fast, which lang file holds the new strings.
+Plus one `Framework:` line whenever the task writes or changes code (Step 5.2b) —
+the installed versions and the idiomatic feature of that version to use.
+Omit the subsection when no dimension applies and no code is written.
+
 ### Tests to add
 Unit / feature / Dusk / Cypress / Playwright as appropriate.
 
@@ -759,6 +929,134 @@ Unit / feature / Dusk / Cypress / Playwright as appropriate.
 The `### Zdroj` block is **mandatory** even when the Projects API exposes a
 native `deskTicketId` field — having the URL visible in the description avoids
 relying on UI features.
+
+### 5.2a — Cross-cutting requirements (`Prierezové požiadavky`)
+
+A customer describes what they want to *see*; they never ask whether the new
+screen can be found from the menu, who may press the new button, or what the
+list does with a year of data. `teamwork-task-test` checks exactly those four
+things at QA time (its Step 6.6 dimensions `ui_ux`, `performance`, `security`,
+`reachability`). Write the ones that **apply** into the task so the engineer
+builds them in, instead of QA finding them afterwards. A pure backend fix grows
+no UI lines; a copy change grows none at all — then omit the sub-heading.
+
+| Key | Applies when the task … | The criterion states (sk example) |
+|---|---|---|
+| `reachability` | adds, renames or removes a screen — page, route rendering a view, Nova resource / lens / dashboard / tool, SPA route | „Obrazovka *Export faktúr* je dostupná z menu *Fakturácia* pre rolu X a z detailu zákazníka (tlačidlo / záložka)." A deliberately URL-only page says so („len cez odkaz z e-mailu, zámerne bez menu"). Rename / removal: „Žiadna položka menu ani odkaz z inej obrazovky nevedie na zrušenú adresu." |
+| `security` | adds a route, action, button, endpoint or form input | „Akciu vidí a spustí len rola X a len nad záznamami vlastnej firmy; cudzí záznam vráti 403, nie 500. Viditeľnosť v menu a autorizácia sa zhodujú." |
+| `performance` | adds or changes a list, export, import, report, batch job or data migration over a table that grows | „Export 10 000 faktúr prebehne bez timeoutu (dávkovo / na pozadí) a zoznam je stránkovaný." |
+| `ui_ux` | changes anything a user sees | „Prázdny, načítavací a chybový stav sú navrhnuté; neaktívne tlačidlo ukazuje dôvod; nové texty idú cez preklady." |
+
+- **Placement is load-bearing:** the `### Prierezové požiadavky` sub-heading sits
+  inside `## Akceptačné kritériá` — after the customer-facing criteria, before
+  the first `---` — because `teamwork-task-test` reads and ticks only the block
+  between that heading and the first `---`. Never put a `---` inside it. Every
+  item is `- [ ]`.
+- **Labels:** sk — `### Prierezové požiadavky`, `UI/UX (ui_ux)`,
+  `Výkon (performance)`, `Bezpečnosť (security)`, `Dostupnosť (reachability)`;
+  en (`--language=en`) — `### Cross-cutting requirements`, `UI/UX (ui_ux)`,
+  `Performance (performance)`, `Security (security)`,
+  `Reachability (reachability)`. The key in parentheses is the
+  `teamwork-task-test` dimension name — keep it. The technical subsection is
+  `### Kvalita (UI/UX, výkon, bezpečnosť, dostupnosť, framework)` /
+  `### Quality (UI/UX, performance, security, reachability, framework)`.
+- **Only these four keys.** The fifth dimension, `framework`, never appears in
+  this sub-block — it is technical-plan only (Step 5.2b).
+- Make each item concrete from the ticket and the repo (the real menu section,
+  the real parent screen, the real role). What you cannot tell becomes an
+  `[OTVORENÉ]` marker or a Step 7 question — never a guessed menu path.
+- **These are engineering internals.** They go into the Projects task only —
+  never into the Step 13b customer-reply DRAFT.
+
+### 5.2b — Framework versions and idioms (`framework`) — technical plan only
+
+The code this task leads to should use the idioms of the framework versions the
+project **actually has installed** — not a pattern remembered from an older
+release, and not hand-rolled code for something the framework already ships.
+`teamwork-task` and the laravel agents follow that while writing;
+`teamwork-task-test` reviews it as a fifth dimension, `framework`, which is
+**advisory** — it only recommends and never fails or ticks anything. The plan
+prepares for it: when the task writes or changes code, the `### Kvalita`
+subsection gets one line, e.g.:
+
+```
+- Framework: Laravel 12.28, PHP 8.3 — `casts()` metóda + enum cast namiesto poľa `$casts`; Tailwind 4 — tokeny cez `@theme` v CSS, nie `tailwind.config.js`
+```
+
+Read the versions from the files, only inside the target repo. With Laravel
+Boost installed, its `application-info` tool also reports the PHP, Laravel and
+main package versions. It does not report browserslist, Node, Vite, TypeScript
+or Nuxt, so run the snippet anyway:
+
+```bash
+# Installed framework / language versions — read from the files, never from memory.
+# ROOT = the nearest directory from here up to the git root that holds a manifest
+# (the Laravel / JS app may live in a subdirectory of the repository).
+TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+ROOT=$(pwd -P)
+while [ ! -f "$ROOT/composer.json" ] && [ ! -f "$ROOT/package.json" ] \
+      && [ "$ROOT" != "$TOP" ] && [ "$ROOT" != "/" ]; do
+  ROOT=$(dirname "$ROOT")
+done
+FOUND=0
+if [ -f "$ROOT/composer.json" ]; then
+  FOUND=1
+  jq -r '"php " + ((.config.platform.php // .require.php // "?") | tostring)' "$ROOT/composer.json" \
+    || echo "⚠ $ROOT/composer.json is not valid JSON — PHP version unknown" >&2
+fi
+if [ -f "$ROOT/composer.lock" ]; then
+  jq -r '[(.packages // [])[], (."packages-dev" // [])[]][]
+         | select(.name | test("^(laravel/(framework|nova)|livewire/livewire|inertiajs/inertia-laravel|pestphp/pest)$"))
+         | "\(.name) \(.version)"' "$ROOT/composer.lock" \
+    || echo "⚠ $ROOT/composer.lock is not valid JSON — Composer versions unknown" >&2
+fi
+NPM_RE='^(vue|nuxt|react|tailwindcss|vite|typescript|@ionic/vue|@inertiajs/vue3)$'
+if [ -f "$ROOT/package-lock.json" ]; then
+  FOUND=1
+  # lockfileVersion 2/3 list `packages["node_modules/<name>"]`; version 1 only `dependencies`.
+  jq -r --arg re "$NPM_RE" 'if has("packages")
+           then (.packages | to_entries[] | select(.key | startswith("node_modules/"))
+                 | {n: (.key | ltrimstr("node_modules/")), v: .value.version})
+           else ((.dependencies // {}) | to_entries[] | {n: .key, v: .value.version}) end
+         | select(.n | test($re)) | "\(.n) \(.v)"' "$ROOT/package-lock.json" \
+    || echo "⚠ $ROOT/package-lock.json is not valid JSON — npm versions unknown" >&2
+elif [ -f "$ROOT/package.json" ]; then
+  FOUND=1
+  jq -r --arg re "$NPM_RE" '((.dependencies // {}) + (.devDependencies // {})) | to_entries[]
+         | select(.key | test($re)) | "\(.key) \(.value) (declared, no package-lock.json)"' "$ROOT/package.json" \
+    || echo "⚠ $ROOT/package.json is not valid JSON — npm versions unknown" >&2
+fi
+[ -f "$ROOT/package.json" ] && jq -r '.browserslist // empty
+  | if type == "array" then join(", ") else tostring end | "browserslist: " + .' "$ROOT/package.json"
+[ -f "$ROOT/.browserslistrc" ] && grep -Ev '^[[:space:]]*(#|$|\[)' "$ROOT/.browserslistrc" | sed 's/^/browserslist: /'
+[ -f "$ROOT/.nvmrc" ] && printf 'node %s\n' "$(head -n 1 "$ROOT/.nvmrc")"
+[ "$FOUND" = "0" ] && echo "framework: no composer.json / package.json between $(pwd -P) and $TOP — use the generic line"
+echo "framework root: $ROOT"
+true
+```
+
+- **Not inside the target repo** → one generic line and no feature claim. That
+  covers two cases. The snippet may find no manifest. Or the repo you are running
+  in may belong to a different project than the ticket's target. In the second
+  case the snippet prints versions, but they are the wrong project's, so do not
+  use them. The generic line: `- Framework: rešpektovať nainštalované verzie (composer.lock /
+  package.json) a ich aktuálne idiómy.`
+- **A feature you name must exist in the installed version.** Look it up in
+  current docs, not in memory — Laravel Boost `search-docs` when the project
+  has `laravel/boost`, otherwise context7 (`resolve-library-id` → `query-docs`),
+  otherwise the official docs / upgrade guide of that major version. Never plan
+  an API deprecated in the installed version, or one newer than it / than the
+  browserslist target. What you cannot verify stays out — the version line on
+  its own is fine.
+- **Consistency beats novelty.** The project's `CLAUDE.md` and the sibling
+  code's conventions win; no second pattern next to an established one unless
+  the task is a refactor; no step that rewrites code the task does not touch.
+- **Plan only — never an acceptance criterion.** No `- [ ]` line and no entry
+  under `### Prierezové požiadavky`: the tester treats `framework` as advisory,
+  so such a box could never be ticked. It costs no Step 7 question either — the
+  versions come from the files.
+- A task that writes no code (a copy or setting changed in the admin, a manual
+  data fix) gets no framework line.
 
 ### 5.3 — Subtasks (optional)
 
@@ -775,7 +1073,10 @@ When proposed, each subtask gets:
   `desk_skill.subtasks.role_prefixes`), then a short business-friendly name
 - **Description** — the same canonical structure as the main task minus the
   preamble (subtasks always begin with AC) and minus the `### Zdroj` block
-  (only the main task carries the source link)
+  (only the main task carries the source link). Each subtask carries the
+  cross-cutting items of its own layer (Step 5.2a) — typically `reachability`
+  and `ui_ux` on `[FE]`, `security` and `performance` on `[BE]` / `[Migration]` —
+  and the `Framework:` line of its own stack (Step 5.2b)
 - **Estimate** — own value, summed up later to validate against the main task's
   estimate
 
@@ -837,11 +1138,14 @@ For each non-empty email:
 
 ```bash
 EMAIL_ENCODED=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$EMAIL")
-RESPONSE=$(curl -sS -u "$PROJECTS_AUTH" \
+RESP=$(curl -sS -u "$PROJECTS_AUTH" -H "Accept: application/json" -w '\n%{http_code}' \
   "${BASE_URL}/projects/api/v3/people.json?searchTerm=${EMAIL_ENCODED}&pageSize=10")
-MATCHES=$(jq -r '
+HTTP=${RESP##*$'\n'}; RESPONSE=${RESP%$'\n'*}
+[ "$HTTP" = "200" ] || echo "⚠ GET people.json → HTTP $HTTP — treating as 0 matches; the next question lets you retry or leave it unassigned" >&2
+# The email travels as a jq --arg, never spliced into the jq program text.
+MATCHES=$(jq -r --arg e "$EMAIL" '
   [ (.people // []) | .[]
-    | select((.email // .emailAddress // "") | ascii_downcase == ("'$EMAIL'" | ascii_downcase))
+    | select((.email // .emailAddress // "") | ascii_downcase == ($e | ascii_downcase))
   ]' <<<"$RESPONSE")
 ```
 
@@ -874,6 +1178,11 @@ Same batched-`AskUserQuestion` pattern as `teamwork-task-analyze` Step 6.2:
   - Data/schema choices → Data model section
 - Unanswered + dropped questions → preserve as `[OTVORENÉ] <question>` markers
   in the relevant section so they do not silently disappear
+- Questions about the cross-cutting requirements (Step 5.2a — which menu
+  section, which roles may see the new action, how many rows the export must
+  handle) come out of the **same** budget. Answer them from the repo first (the
+  sibling screens' menu registration, the neighbouring policies); ask only what
+  the code cannot tell
 
 ---
 
@@ -940,25 +1249,34 @@ done
 
 # Per-subtask files — one newline-delimited string variable per index, named
 # SUBTASK_FILES_<i>. Build them from the sub_<n> buckets (sub_1 → index 0, …).
-for n in "${!SUBTASK_NAMES[@]}"; do     # n is 0-based; bucket key is sub_$((n+1))
+# A counter loop, NOT `for n in "${!SUBTASK_NAMES[@]}"` — array-key expansion is
+# `bad substitution` in zsh, which aborted this block before any list was built.
+n=0
+while [ "$n" -lt "${#SUBTASK_NAMES[@]}" ]; do   # n is 0-based; bucket key is sub_$((n+1))
   bucket="MAP_SUB_$((n + 1))"          # e.g. MAP_SUB_1 = array of filenames
   # bash 3.2-safe dynamic array read. `declare -n` (nameref) needs bash 4.3+,
   # but macOS ships bash 3.2.57 where it silently fails and leaves the lists
   # empty — so the subtask attachments would never upload. eval copies the
-  # dynamically-named array into ref; an unset/empty bucket yields an empty ref.
-  eval "ref=( \"\${${bucket}[@]}\" )" 2>/dev/null || ref=()
+  # dynamically-named array into ref. An unset bucket is an empty ref in bash
+  # but ONE EMPTY element in zsh — hence the `[ -n "$f" ]` guard below, without
+  # which zsh would queue "${ATT_DIR}/" (the directory itself) for upload.
+  eval "ref=( \"\${${bucket}[@]}\" )"
   lines=""
   for f in "${ref[@]}"; do
+    [ -n "$f" ] || continue
     lines+="${ATT_DIR}/${f}"$'\n'
   done
   printf -v "SUBTASK_FILES_${n}" '%s' "$lines"
+  n=$((n + 1))
 done
 ```
 
 The `eval "ref=( \"\${${bucket}[@]}\" )"` form above is intentional: it reads a
 dynamically-named array without `declare -n` (nameref), so it works on macOS
-stock bash 3.2 as well as modern bash. `printf -v "SUBTASK_FILES_${n}"` is also
-bash 3.1+ safe, so the whole materialisation block is portable.
+stock bash 3.2, modern bash and zsh. `printf -v "SUBTASK_FILES_${n}"` works in
+bash 3.1+ and zsh, so the whole materialisation block is portable. Variables do
+not survive between Bash calls — run this block in the **same** call as the
+Step 12 upload loop.
 
 ---
 
@@ -1090,7 +1408,10 @@ d=json.load(sys.stdin); now=datetime.datetime.utcnow()
 for t in d.get('tasks',[]):
     if t.get('name') == want:
         # Skip if created in the last 60 s (assume it is our prior attempt).
-        ts = t.get('dateCreated') or t.get('dateUpdated') or ''
+        # v3 task objects carry `createdAt` / `updatedAt` — `dateCreated` does
+        # not exist there, so reading only it (pre-1.3.0) never matched and a
+        # retry created a duplicate task.
+        ts = t.get('createdAt') or t.get('dateCreated') or t.get('updatedAt') or ''
         try:
             dt = datetime.datetime.strptime(ts.rstrip('Z'), '%Y-%m-%dT%H:%M:%S')
             if (now - dt).total_seconds() < 60:
@@ -1136,8 +1457,14 @@ After the main task is created, probe whether the workspace's Projects API
 exposes a native Desk-link attribute:
 
 ```bash
-PROBE=$(curl -sS -u "$PROJECTS_AUTH" \
+RESP=$(curl -sS -u "$PROJECTS_AUTH" -H "Accept: application/json" -w '\n%{http_code}' \
   "${BASE_URL}/projects/api/v3/tasks/${MAIN_TASK_ID}.json?include=deskTicket,helpDeskTicket")
+HTTP=${RESP##*$'\n'}; PROBE=${RESP%$'\n'*}
+if [ "$HTTP" != "200" ]; then
+  # An error body would make HAS_NATIVE neither "true" nor "false".
+  echo "⚠ Desk-link probe GET tasks/${MAIN_TASK_ID}.json → HTTP $HTTP — treating as no native link; the ### Zdroj URL is the link" >&2
+  PROBE='{}'
+fi
 HAS_NATIVE=$(jq -r '
   ((.task // {}) | has("deskTicket"))
   or ((.task // {}) | has("helpDeskTicket"))
@@ -1153,10 +1480,16 @@ other):
 ```bash
 LINK_PAYLOAD=$(jq -n --arg tid "$TICKET_ID" \
   '{ task: { deskTicketId: ($tid|tonumber), helpDeskTicketId: ($tid|tonumber) } }')
-curl -sS -u "$PROJECTS_AUTH" -X PATCH -d "$LINK_PAYLOAD" \
-  -H "Content-Type: application/json" \
-  "${BASE_URL}/projects/api/v3/tasks/${MAIN_TASK_ID}.json" > /dev/null
-NATIVE_DESK_LINK="applied"
+HTTP=$(curl -sS -u "$PROJECTS_AUTH" -X PATCH -d "$LINK_PAYLOAD" \
+  -H "Content-Type: application/json" -o /dev/null -w '%{http_code}' \
+  "${BASE_URL}/projects/api/v3/tasks/${MAIN_TASK_ID}.json")
+if [ "$HTTP" -ge 200 ] 2>/dev/null && [ "$HTTP" -lt 300 ]; then
+  NATIVE_DESK_LINK="applied"
+else
+  # Do not report "applied" for a PATCH that failed — the ### Zdroj URL stays the link.
+  echo "⚠ native Desk-link PATCH → HTTP $HTTP — falling back to the ### Zdroj URL" >&2
+  NATIVE_DESK_LINK="fallback"
+fi
 ```
 
 If `HAS_NATIVE == "false"`, fall back to the URL in `### Zdroj` (already in
@@ -1178,7 +1511,7 @@ subtask payload, look up the userId for that role from the Step 6 map:
 # ASSIGNEE_MAP is a JSON object built in Step 6:
 #   { "BE": "12345", "FE": "67890", "QA": "", ... }
 # Parse the role from the subtask name prefix:
-SUB_ROLE=$(echo "$SUB_NAME" | sed -nE 's|^\[([A-Za-z]+)\].*|\1|p')
+SUB_ROLE=$(printf '%s' "$SUB_NAME" | sed -nE 's|^\[([A-Za-z]+)\].*|\1|p')
 SUB_ASSIGNEE_ID=$(jq -r --arg r "$SUB_ROLE" '.[$r] // ""' <<<"$ASSIGNEE_MAP")
 
 # When the subtask has no role prefix (single-role task, or split disabled),
@@ -1312,7 +1645,7 @@ print(json.dumps({'task': {'pendingFileAttachments': ref}}))" "$pending_ref")
   assigned=$(python3 -c "
 import json
 d = json.load(open('/tmp/tw_attach.json'))
-print(','.join(d.get('assignedFileIds') or []))")
+print(','.join(str(x) for x in (d.get('assignedFileIds') or [])))")
 
   if [ -z "$assigned" ]; then
     ATTACHMENT_FAILURES+=("${filename}: PUT returned 200 but assignedFileIds is empty — possible silent-fail")
@@ -1329,19 +1662,29 @@ print(','.join(d.get('assignedFileIds') or []))")
 # Per-subtask files are NOT a nested array (bash has no nested arrays). Instead,
 # each subtask index i has its own newline-delimited string variable
 # SUBTASK_FILES_<i> (populated in Step 8 — see "Materialise the file lists").
-# We read it back via indirect expansion.
+# Same Bash call as Step 8.1, with SUBTASK_IDS re-declared from the Step 11
+# output (`SUBTASK_IDS=(<id> <id> …)` in subtask order).
+#
+# Portable in zsh and bash 3.2 — until 1.3.0 this used `"${!SUBTASK_IDS[@]}"`
+# and `"${!list_var}"` (both `bad substitution` in zsh) and `${SUBTASK_IDS[$i]}`
+# with a 0-based i (zsh arrays are 1-based, so it read the wrong id or nothing).
+# `upload_and_attach` records every failure in ATTACHMENT_FAILURES itself, so the
+# `|| true` below only keeps the loop going; nothing is swallowed.
 for FILE_PATH in "${MAIN_TASK_FILES[@]}"; do
   [ -n "$FILE_PATH" ] || continue
   upload_and_attach "$FILE_PATH" "$MAIN_TASK_ID" || true
 done
-for i in "${!SUBTASK_IDS[@]}"; do
-  list_var="SUBTASK_FILES_${i}"
-  list="${!list_var:-}"
-  [ -n "$list" ] || continue
-  while IFS= read -r FILE_PATH; do
-    [ -n "$FILE_PATH" ] || continue
-    upload_and_attach "$FILE_PATH" "${SUBTASK_IDS[$i]}" || true
-  done <<< "$list"
+i=0
+while [ "$i" -lt "${#SUBTASK_IDS[@]}" ]; do
+  SUB_TASK_ID="${SUBTASK_IDS[@]:$i:1}"          # slice: 0-based in bash AND zsh
+  eval "list=\${SUBTASK_FILES_${i}:-}"          # indirect read without ${!name}
+  if [ -n "$list" ]; then
+    while IFS= read -r FILE_PATH; do
+      [ -n "$FILE_PATH" ] || continue
+      upload_and_attach "$FILE_PATH" "$SUB_TASK_ID" || true
+    done <<< "$list"
+  fi
+  i=$((i + 1))
 done
 
 # Persist on first run when defaults landed
@@ -1455,6 +1798,7 @@ threadType is the top-level enum, and `isPrivate: true` is the modern name for
 the "internal note" flag:
 
 ```bash
+# (Desk call preamble from Step 2.6 goes here — same Bash call.)
 NOTE_BODY_PATH="$(mktemp)"
 printf '%s' "$NOTE_HTML" > "$NOTE_BODY_PATH"
 
@@ -1527,6 +1871,11 @@ If `DRAFT_REPLY == "false"` → skip (record `⏭ skipped` in the final report).
   (default `sk`)
 - **Tone** — from `--draft-tone` → `desk_skill.customer_reply_draft.tone`
   (default `formal`); supports `formal`, `casual`, `empathetic`
+- **No engineering internals.** The draft is for the customer: it never mentions
+  the `Prierezové požiadavky` / `Kvalita` content (menu entries, policies,
+  authorization, pagination, indexes, performance numbers, framework versions),
+  file paths, module or class names, subtasks, or the estimate in minutes. Only the business
+  outcome from `## Cieľ`, the timeframe and the open questions.
 - **Content shape** (sk example, formal tone):
 
   ```
@@ -1575,6 +1924,7 @@ Post identical to Step 13.2 — `threadType: "note"`, `isPrivate: true`,
 `editMethod: "html"`, body in the top-level `message` field:
 
 ```bash
+# (Desk call preamble from Step 2.6 goes here — same Bash call.)
 DRAFT_BODY_PATH="$(mktemp)"
 printf '%s' "$DRAFT_HTML" > "$DRAFT_BODY_PATH"
 
@@ -1590,10 +1940,18 @@ json.dump({
 }, open(sys.argv[2], "w"), ensure_ascii=False)
 PY
 
-desk_curl \
+HTTP=$(desk_curl \
   -H "Content-Type: application/json" \
   -X POST -d @"$DRAFT_PAYLOAD_PATH" \
-  "${DESK_API}/tickets/${TICKET_ID}/messages.json" > /dev/null
+  -o /tmp/tw_draft_resp.json -w '%{http_code}' \
+  "${DESK_API}/tickets/${TICKET_ID}/messages.json")
+if [ "$HTTP" = "201" ] || [ "$HTTP" = "200" ]; then
+  echo "✅ Customer-reply DRAFT posted as an internal note"
+else
+  # Pre-1.3.0 sent this to /dev/null and the report said "posted" regardless.
+  echo "❌ DRAFT note failed (HTTP $HTTP):" >&2
+  head -c 500 /tmp/tw_draft_resp.json >&2
+fi
 rm -f "$DRAFT_BODY_PATH" "$DRAFT_PAYLOAD_PATH"
 ```
 
@@ -1628,8 +1986,14 @@ end-to-end "how long did this hand-off take?" number so future runs can be
 calibrated against it.
 
 ```bash
+# RUN_START_EPOCH / RUN_START_ISO re-declared here from the Step 1.1 output.
 RUN_END_EPOCH=$(date -u +%s)
 RUN_END_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+if [ -z "${RUN_START_EPOCH:-}" ]; then
+  # Unset, the subtraction below reports the whole Unix epoch as the run time.
+  echo "⚠ RUN_START_EPOCH is not set in this Bash call — re-declare it from the Step 1.1 output; duration reported as 0" >&2
+  RUN_START_EPOCH=$RUN_END_EPOCH; RUN_START_ISO="unknown"
+fi
 RUN_DURATION_SECONDS=$(( RUN_END_EPOCH - RUN_START_EPOCH ))
 RUN_DURATION_MINUTES=$(( RUN_DURATION_SECONDS / 60 ))
 RUN_DURATION_REMAINDER=$(( RUN_DURATION_SECONDS % 60 ))
@@ -1866,6 +2230,11 @@ here — never re-introduce a buffer percentage.
   so stripping the link deletes the screenshot
 - Never re-words, re-spells, translates or tidies the reporter's own text; the
   preamble is a record, not a draft
+- Never puts engineering internals — the `Prierezové požiadavky` / `Kvalita`
+  content, file paths, subtasks, the estimate in minutes — into the
+  customer-reply DRAFT
+- Never drafts a task from an unreadable ticket thread — a failed
+  `/messages.json` stops the run
 - Never overwrites an existing Projects task — running on the same Desk ticket
   twice will create a second task (idempotency detection is deferred to a
   future version; if you re-run, cancel at Step 9 and clean up manually)
@@ -1883,10 +2252,16 @@ here — never re-introduce a buffer percentage.
 | Desk 403 on `/attachments.json` | Build the file_id set from `messages[].files[]` instead |
 | Desk 403 on `/threads.json` POST | Use `/messages.json` POST with top-level fields (1.0.1) |
 | Desk 403/404 on other endpoints | Stop with the failing URL printed |
-| Desk thread/messages endpoint 404 | Probe v1; record the working one in config |
+| Desk `/threads.json` non-200 (403 "You Must Upgrade" on most tiers) | Expected — fall back to `/messages.json` |
+| Desk `/messages.json` non-200, or 200 without a `messages[]` array | `❌` with the URL + error detail; stop — never draft from an empty thread |
+| Desk thread page 2..N non-200 | `❌` with the page URL; stop — never draft from a truncated thread |
+| Desk thread/messages endpoint 404 on v2 | Probe v1; record the working one in config |
+| Desk customer / inbox lookup non-200 | `⚠`; name / inbox left blank, run continues |
+| Attachment text extraction fails (no pdftotext / pandoc) | `⚠` naming the file; Step 5 works without its text |
 | Projects URL unparseable | AskUserQuestion for a corrected URL |
 | Projects 401 | Re-prompt the Projects token (shared with siblings) |
 | Projects 403 on tasklist | Stop with a clear "no access" message |
+| Projects 404 on tasklist | Stop — wrong URL or a completed tasklist (completed lists answer 404) |
 | Email resolves to 0 people | AskUserQuestion (retry / unassigned / cancel) |
 | Email resolves to ≥2 people | AskUserQuestion to pick the right person |
 | Main task POST returns no id | Idempotency probe (1.0.1) — search by name + recent timestamp before retrying |
@@ -1894,6 +2269,9 @@ here — never re-introduce a buffer percentage.
 | Attachment download non-2xx | Log `⏭`, continue |
 | Attachment attach returns 200 but `assignedFileIds` empty | Treat as failure — log `❌`; retry once with v1 PUT (1.0.1 default) |
 | Desk note POST non-2xx | Log `❌`, continue — the task is already created |
+| Desk DRAFT note POST non-2xx | Log `❌` with the body, report it as failed — never "posted" |
+| Native Desk-link PATCH non-2xx | `⚠`; `NATIVE_DESK_LINK=fallback` (the `### Zdroj` URL is the link) |
+| `desk_curl: command not found` / empty status | The Desk call preamble (Step 2.6) is missing from that Bash call — add it |
 | `jq` parse error when displaying Projects response | Suppress + retry parse via Python; never panic-retry the POST |
 
 ---

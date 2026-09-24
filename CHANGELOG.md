@@ -4,6 +4,145 @@ All notable changes to the `teamwork-tasks-from-desk` plugin are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-09-24
+
+Source: reported in a colleague's "Štyri cesty k nule" analysis, which traced a
+family of *silent* failures in the Teamwork plugins to bash-only snippets running
+under zsh and to v3 fields that do not exist. Claude Code's Bash tool runs zsh on
+macOS; each of the defects below produced an empty result instead of an error.
+
+### Fixed
+- **An explicit `false` in the config was switched back on at every run.** The
+  Step 2 migration set boolean defaults with `//= true`, and jq's `//` treats
+  `false` like a missing key — so e.g. `desk_skill.subtasks.enabled`,
+  `customer_reply_draft.enabled` or `timing.report_run_duration` set to `false`
+  were silently rewritten to `true` on the next run. Defaults now apply only to
+  a missing / `null` value (`|= (if . == null then true else . end)`), the same
+  rule teamwork-task 1.5.0 uses for the shared config.
+- **Every attachment was lost in zsh.** Step 3.3 looped `for FILE_ID in $FILE_IDS`.
+  zsh does not word-split an unquoted variable, so the loop ran once with all ids
+  glued together by newlines, requested one malformed download URL, recorded one
+  failure and moved on — the task was created without a single screenshot. Now a
+  `while IFS= read -r` loop.
+  Repro: `zsh -c 'X=$(printf "111\n222"); for i in $X; do echo "[$i]"; done'` →
+  one iteration, `[111⏎222]`.
+- **Subtask attachments never uploaded in zsh.** Step 8.1 used
+  `"${!SUBTASK_NAMES[@]}"` and Step 12 `"${!SUBTASK_IDS[@]}"` and `"${!list_var}"`
+  — all `bad substitution` in zsh, aborting both blocks. Step 12 also read
+  `${SUBTASK_IDS[$i]}` with a 0-based `i`; zsh arrays are 1-based, so even a working
+  loop would have attached files to the wrong subtask or to none. Replaced by counter
+  loops, the `${ARR[@]:$i:1}` slice and an `eval` indirect read. While testing it:
+  in zsh an unset `MAP_SUB_<n>` bucket copies in as **one empty element**, which
+  queued the attachment directory itself for upload — now skipped.
+  Repro: `zsh -c 'A=(x y); echo ${!A[@]}'` → `bad substitution`;
+  `zsh -c 'A=(11 22); echo "${A[0]}|${A[@]:0:1}"'` → `|11`.
+- **`desk_curl` did not exist after Step 2.6.** It was defined once and called in
+  Steps 3, 3.1, 3.2, 3.3, 13.2 and 13b, but every Bash tool call is a fresh shell,
+  so each of those calls hit `command not found` and read the empty status as "no
+  ticket / no thread / no attachments". A *Desk call preamble* now re-creates it
+  from the config (token, persisted auth scheme, API base) at the top of every
+  call that uses it, and refuses to run with no scheme.
+- **A failed `/messages.json` read as an empty thread.** `/threads.json` answers
+  `403 "You Must Upgrade Your Account"` on the WAME tier, so the `/messages.json`
+  fallback is the normal path (kept — verified 2026-09-24: 403 → 200, 35 items on a
+  live ticket). Its status was not checked: an error body in `/tmp/threads.json`
+  became `(.messages // .threads // [])` = `[]`, and the task was drafted without the
+  customer's words. Now a non-200, or a 200 without a `messages[]` array, stops the
+  run with the URL and the error detail.
+- **The retry guard could not recognise the task it had just created.** The Step 10
+  idempotency probe compared `dateCreated` / `dateUpdated`; v3 task objects carry
+  `createdAt` / `updatedAt`, so the guard never matched and a retry created a
+  duplicate task. Reads `createdAt` first now.
+- **The tasklist flow could not name the project.** Step 4.2 said to read
+  `project.name` from `GET /tasklists/{id}.json`; `.tasklist.project` is only an
+  `{id, type}` reference. Now `?include=projects` and
+  `.included.projects["<id>"].name`, with `.tasklist.projectId` for the id.
+  Repro: `GET /projects/api/v3/tasklists/3361804.json` → `.tasklist.project` =
+  `{"id":700336,"type":"projects"}`, no name.
+- **Writes reported success they did not have.** The customer-reply DRAFT POST went
+  to `> /dev/null` and the report said "posted"; the native Desk-link PATCH set
+  `NATIVE_DESK_LINK="applied"` regardless of the answer. Both check the status now.
+- **Other swallowed errors:** the ticket GET (401 / 403 / 404 now stop with the URL),
+  customer / inbox / people lookups and the native Desk-link probe (`⚠` + named
+  fallback), and the PDF / DOCX /
+  XLSX text extraction (`|| true` → a `⚠` naming the file).
+- **The customer and the inbox were blank on every run.** Step 3.1 read the name
+  and e-mail from `.ticket.customer` / `.ticket.inbox`, which on Desk v2 are only
+  `{id, type}` references; the separately fetched customer / inbox objects were
+  never read. The `### Zdroj` Customer line and the reply-draft salutation came out
+  empty. The extraction now reads `included`, then the fetched objects, then an
+  embedded object, and warns when nothing is found.
+  Repro: `GET /desk/api/v2/tickets/<id>.json?include=customer,inbox` →
+  `.ticket.customer` = `{"id":…,"type":"customers"}`, `.included` = `{}`.
+- **Threads longer than 100 items were cut off.** Step 3.2 fetched page 1 only
+  (`pageSize=100`) although the text said to page through, so the newest messages
+  of a long ticket, and their attachments, were silently missing. Pages 2..N are
+  now fetched and appended; a failed page stops the run (verified with
+  `pageSize=10` on a 24-item ticket: 3 pages, 24 unique items, chronological).
+- **Every downloaded attachment was then rejected by the allow-list.** The filename
+  was sniffed with a second `desk_curl -I` (HEAD) request, and the download endpoint
+  answers HEAD with 403, so every file became `file_<id>` with no extension and was
+  skipped as "extension blocked by config". The filename now comes from the
+  `Content-Disposition` of the download GET itself (`curl -D`), is stripped to a
+  basename, and a reused name (`image001.png` in every e-mail) gets the file id as a
+  prefix instead of overwriting the earlier file. Verified read-only on a live
+  ticket: 16 of 16 attachments saved under their real names (before: 0).
+  Repro: `desk_curl -I -L "$DESK_API/files/<id>/download.json"` → `HTTP/2 403`;
+  the same URL with GET → `303` → `200`, `Content-Disposition: attachment; filename="image003.png"`.
+- **The download loop could run zero times.** It used the `FILE_IDS` of the
+  preceding snippet, which does not exist in a fresh Bash call; the id list is now
+  re-derived from `/tmp/threads.json` inside the download call.
+- Step 1.1 told the model to keep `RUN_START_EPOCH` as a shell variable for Step 14,
+  which a fresh shell does not have — the duration then came out as the whole Unix
+  epoch. It is now printed for re-declaration, and Step 14.1 warns when it is unset.
+- The assignee email and the base URL were spliced into jq program text; both are
+  `--arg` now. `echo "$SUB_NAME" | sed` → `printf`. `assignedFileIds` are joined as
+  strings, so numeric ids no longer raise in the verification step.
+
+### Added
+- **Cross-cutting requirements in the drafted task** (Step 5.2a). The acceptance
+  criteria gain a `### Prierezové požiadavky` sub-block with the dimensions that
+  apply — `reachability` (a new screen is reachable from the menu and from the
+  related screens; a deliberate URL-only page is named as such), `security` (new
+  actions behind the same gate plus an object-scoped check; menu visibility and
+  authorization agree), `performance` (lists and exports at real data volume) and
+  `ui_ux` (states, accessible controls, translations) — named with the same keys
+  `teamwork-task-test` 1.1.0 uses at QA time, so the build side and the QA side read
+  one list. The sub-block sits before the first `---`, so `teamwork-task-test` can
+  tick it. The technical section gains a short `### Kvalita` subsection; subtasks
+  carry the items of their own layer. Nothing is added where a dimension does not
+  apply, questions about them stay inside the existing batch-of-4 / max-6 budget,
+  and the Step 13b customer-reply DRAFT is explicitly forbidden from mentioning any
+  of it.
+- **Framework versions and idioms in the technical plan** (Step 5.2b, key
+  `framework`). Model memory of a framework lags a version or two, so a plan could
+  steer the implementer to a pattern the installed Laravel / Vue / Tailwind has
+  replaced — or to one it does not support yet. When the task writes code, the
+  `### Kvalita` subsection now carries one `Framework:` line with the installed
+  versions and the idiomatic feature of that version to use. A zsh/bash-safe
+  snippet reads the versions from `composer.json` (`config.platform.php` /
+  `require.php`), `composer.lock`, `package-lock.json` (lockfile v1–v3, or the
+  declared range in `package.json`), `browserslist` and `.nvmrc`. It reads them in
+  the nearest directory up to the git root that holds a manifest, because the app
+  may sit in a subdirectory of the repo. Laravel Boost's `application-info` covers
+  the PHP, Laravel and main package versions. The feature is
+  verified in current docs (Boost `search-docs`, context7, official docs), never
+  from memory. Guardrails: the project's `CLAUDE.md` and sibling conventions win,
+  nothing deprecated in or newer than the installed version, no rewrite of code the
+  task does not touch; outside the target repo a generic line without a feature
+  claim. Plan only — **never** an acceptance criterion or a `Prierezové požiadavky`
+  item: `teamwork-task-test` treats `framework` as an advisory recommendation, so
+  such a box could never be ticked. The subsection heading is
+  `### Kvalita (UI/UX, výkon, bezpečnosť, dostupnosť, framework)` (en `### Quality
+  (UI/UX, performance, security, reachability, framework)`) — the same label
+  `teamwork-task-analyze` 1.3.0 uses.
+- **Shell portability contract** near the top of `SKILL.md`, so later edits keep the
+  rules above.
+
+Deliberately not changed: the `/threads.json` → `/messages.json` fallback itself,
+the verbatim-preamble rule, the estimate-never-in-the-description rule, the preview +
+confirmation gate, and every "internal note only, never a customer reply" invariant.
+
 ## [1.2.0] — 2026-09-22
 
 ### Fixed

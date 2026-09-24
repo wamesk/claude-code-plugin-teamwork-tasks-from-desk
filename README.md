@@ -69,19 +69,38 @@ The skill then asks (via `AskUserQuestion`):
 1. **Fetches** the Desk ticket — subject, customer, inbox, chronological thread
    of replies and internal notes, every email attachment — via the Teamwork
    Desk REST API. Auto-detects whether the workspace runs Desk API v2 or v1.
+   The thread comes from `/threads.json` or, on tiers where that answers
+   `403 "You Must Upgrade Your Account"`, from `/messages.json` — every page of
+   it; if the thread is not fully readable the run stops instead of drafting a
+   task from an empty or truncated thread.
 2. **Asks for the target Projects URL** (project or tasklist).
 3. **Synthesises a draft main task** in the canonical WAME format:
    `[preamble] → HR → ## Akceptačné kritériá → HR → ## Cieľ → HR → ## Technický popis`,
    ending with a `### Zdroj` block that links back to the Desk ticket.
+   Since 1.3.0 the acceptance criteria carry a `### Prierezové požiadavky`
+   sub-block with the cross-cutting requirements that apply — **reachability**
+   (a new screen gets a menu entry and links from the related screens),
+   **security** (new actions behind the right gate, object-scoped),
+   **performance** (lists / exports at real data volume) and **ui_ux** (states,
+   accessible controls, translations) — the same four dimensions
+   `teamwork-task-test` checks at QA time. The technical section gains a short
+   `### Kvalita` subsection with the *how* — plus, whenever the task writes code,
+   a `Framework:` line naming the versions installed in the repo (read from
+   `composer.lock` / `package-lock.json` / `package.json`, never from memory)
+   and the idiomatic feature of that version to use, checked in current docs.
+   That fifth key, `framework`, is plan only — never an acceptance criterion,
+   because `teamwork-task-test` treats it as advisory. Nothing is added where it
+   does not apply, and none of it ever reaches the customer-reply draft.
 4. **Proposes subtasks** only when the estimate exceeds 240 min and the AC
    have natural cut points (BE/FE/QA/migration/DevOps role prefixes).
 5. **Asks for an assignee email per role** when the task splits — each role
    can be answered independently or left empty.
-6. **Estimates** via the WAME senior-engineer-with-Claude-Code methodology
+6. **Estimates** via the WAME estimate methodology `wame-estimate-v2`
    (one number per task against the anchors, 15 min step, split above 240 min, 480 min cap).
 7. **Pauses with clarifying questions** via `AskUserQuestion` in batches of 4,
-   max 6 per run; folds answers back into AC / Cieľ / Technický popis;
-   preserves anything unresolved as `[OTVORENÉ]` markers.
+   max 6 per run (questions about the cross-cutting requirements included);
+   folds answers back into AC / Cieľ / Technický popis; preserves anything
+   unresolved as `[OTVORENÉ]` markers.
 8. **Maps email attachments** to the right task or subtask — per-file question
    by default; filename heuristic or "everything to main" available via flags.
 9. **Previews the full concept** + waits for confirmation. `--write-back=never`
@@ -112,10 +131,22 @@ The skill then asks (via `AskUserQuestion`):
 - Never logs time
 - Never marks the new task or subtasks as complete
 - Never runs `git commit` / `git push`
+- Never puts engineering internals (cross-cutting requirements, file paths,
+  subtasks, minutes) into the customer-reply draft
 
 It is strictly **read-only against the boards and the timesheet** — the only
 writes are the new Projects task + subtasks + attachments, and the optional
 internal Desk notes.
+
+## Shell portability
+
+The skill's bash snippets run in your login shell — zsh on macOS, bash
+elsewhere — and every Bash tool call is a fresh shell. Since 1.3.0 `SKILL.md`
+carries a **Shell portability contract** (line lists read with
+`while read`, no `${!…}`, 1-based-safe array slices, HTTP status checked on
+every call) and a **Desk call preamble** that re-creates `desk_curl` from the
+config in each call, so later edits do not reintroduce the zsh failures fixed
+in that release.
 
 ## Config
 
