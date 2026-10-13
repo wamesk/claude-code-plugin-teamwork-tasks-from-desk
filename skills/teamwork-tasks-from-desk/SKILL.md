@@ -1,6 +1,6 @@
 ---
 name: teamwork-tasks-from-desk
-description: "Use when the user provides a Teamwork Desk ticket URL (desk/tickets path) and asks to 'vytvor tasky z desk ticketu', 'preklop ticket do projects', 'urob task z desku', 'spracuj desk ticket', 'vytvor projektový task z desku', 'create projects task from desk', 'desk ticket to task', or invokes '/teamwork-tasks-from-desk'. Fetches the ticket (subject, customer, thread, attachments) via the Teamwork Desk REST API, asks for the target Projects URL and an assignee email (one per role when the task splits), drafts a main task in the WAME format (Akceptačné kritériá, Cieľ, Technický popis) with optional subtasks and a wame-estimate-v2 estimate, and asks clarifying questions in batches of 4. After a preview and confirmation creates the tasks, uploads the attachments, links the task to the ticket and posts an internal note in the Desk thread. A customer reply is only ever drafted as an internal note. Never replies to the customer, never moves the ticket, never logs time."
+description: "Use when the user provides a Teamwork Desk ticket URL (desk/tickets path) and asks to 'vytvor tasky z desk ticketu', 'preklop ticket do projects', 'urob task z desku', 'spracuj desk ticket', 'vytvor projektový task z desku', 'create projects task from desk', 'desk ticket to task', or invokes '/teamwork-tasks-from-desk'. Fetches the ticket (subject, customer, thread, attachments) via the Teamwork Desk REST API, asks for the target Projects URL and an assignee email (one per role when the task splits), drafts a main task in the WAME format (Akceptačné kritériá, Cieľ, Technický popis) with optional subtasks and a wame-estimate-v3 estimate, and asks clarifying questions in batches of 4. After a preview and confirmation creates the tasks, uploads the attachments, links the task to the ticket and posts an internal note in the Desk thread. A customer reply is only ever drafted as an internal note. Never replies to the customer, never moves the ticket, never logs time."
 argument-hint: "<desk-ticket-url> [--projects-url=<url>] [--assignee=<email>] [--no-subtasks] [--language=sk|en] [--write-back=ask|auto|never] [--attach-mode=ask|distribute|main] [--notify-desk=ask|true|false] [--draft-reply=ask|true|false] [--draft-tone=formal|casual|empathetic] [--max-questions=N]"
 allowed-tools: [Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion]
 ---
@@ -215,7 +215,7 @@ jq '
 | .desk_skill.sections.source_label_en              //= "Source"
 | .desk_skill.sections.hr_marker                    //= "---"
 | .desk_skill.estimate                              //= {}
-| .desk_skill.estimate.methodology                  //= "wame_estimate_v2"
+| .desk_skill.estimate.methodology                  //= "wame_estimate_v3"
 | .desk_skill.estimate.set_if_missing               |= (if . == null then true else . end)
 | .desk_skill.estimate.step_minutes                 //= 15
 | .desk_skill.estimate.max_task_minutes             //= 480
@@ -224,8 +224,8 @@ jq '
 # not sit in the file reading like a rule somebody still follows.
 | .desk_skill.estimate |= del(.buffer_pct_min, .buffer_pct_max,
                               .speedup_pct_min, .speedup_pct_max)
-| (if .desk_skill.estimate.methodology == "wame_senior_claude_code"
-   then .desk_skill.estimate.methodology = "wame_estimate_v2" else . end)
+| (if .desk_skill.estimate.methodology == "wame_senior_claude_code" or .desk_skill.estimate.methodology == "wame_estimate_v2"
+   then .desk_skill.estimate.methodology = "wame_estimate_v3" else . end)
 | .desk_skill.subtasks                              //= {}
 | .desk_skill.subtasks.enabled                      |= (if . == null then true else . end)
 | .desk_skill.subtasks.propose_split_threshold_minutes //= 240
@@ -1098,7 +1098,7 @@ files; Step 14.4 deletes the directory.
 ### 5.4 — Estimate
 
 Follow the **`## WAME estimate methodology`** block at the bottom of this
-document (`wame-estimate-v2`) — one number per task, picked against the anchors
+document (`wame-estimate-v3`) — one number per task, picked against the anchors
 there. Do not start from a "traditional" estimate and multiply it down; version
 2 removed the speedup factor and the risk buffer, and this skill must not keep a
 private copy of them.
@@ -2189,7 +2189,7 @@ need one removed, that is a question for the user, not a step in the plan.
 
 ## WAME estimate methodology
 
-> Block version `wame-estimate-v2`. Shared **verbatim** across the plugins
+> Block version `wame-estimate-v3`. Shared **verbatim** across the plugins
 > `teamwork-task-analyze`, `teamwork-tasks-from-dnr`, `teamwork-tasks-from-desk`,
 > `teamwork-tasks-from-session` and `dnr-business`. Change it in all five or in
 > none — a per-plugin variant is how two skills start quoting different numbers
@@ -2201,10 +2201,13 @@ open a band almost twice as wide as the guess itself, and in a negotiation the
 widest end of that band always wins. Name the minutes the work takes and defend
 that number.
 
-**Who does the work.** A senior engineer who already knows this codebase,
-directing Claude Code. Claude Code writes the implementation and the tests; the
-engineer decides, reviews and runs the suite. There is no separate QA pass and
-no handover to a second person.
+**Who does the work.** Claude Code writes the code. It reads the codebase,
+implements, writes and runs the tests, builds the assets and fixes what the
+review finds. An engineer who knows the project decides, answers questions and
+reviews the diff. The number is the **session time** until the outcome is done
+and green: Claude working plus the engineer reading, deciding and reviewing. It
+is not the time a person would need to type the same code. There is no separate
+QA pass and no handover to a second person.
 
 **What the number covers**
 
@@ -2237,14 +2240,24 @@ this case different — that sentence is what a reviewer checks.
 | Finished work | Minutes |
 |---|---|
 | Text, label, translation key or config value, plus the test that guards it | 15 |
-| One field, filter or validation rule on one screen, plus a test | 30 |
-| Bug with a stack trace or a one-line repro: fix plus regression test | 60 |
-| Vue/React component wired to an API that already exists, plus a test | 90 |
-| Bug that reproduces but spans 2–3 layers: fix plus tests | 120 |
-| One CRUD endpoint or one screen end to end, plus tests | 120 |
-| Bug with no repro yet: investigate, then fix | 180 |
-| Schema migration with a data backfill and a copy-back assertion | 180 |
-| New module in `wamesk/*` (model, migration, Nova screen, policy, tests) | 300 |
+| One field, filter or validation rule on one screen, plus a test | 15 |
+| Bug with a stack trace or a one-line repro: fix plus regression test | 30 |
+| Query or service method with its rare cases (date ranges, open ends, `NULL`), plus tests | 45 |
+| Vue/React component wired to an API that already exists, plus a test | 45 |
+| One CRUD endpoint or one screen end to end, plus tests | 60 |
+| Bug that reproduces but spans 2–3 layers: fix plus tests | 60 |
+| Bug with no repro yet: investigate, then fix | 90 |
+| Schema migration with a data backfill and a copy-back assertion | 90 |
+| Complex screen that saves several records in one transaction, plus tests | 120 |
+| New module in `wamesk/*` (model, migration, Nova screen, policy, tests) | 150 |
+| Reusable package: PHP API, replaced framework UI components, build, e2e test | 150 |
+
+**Calibration.** The anchors come from measured sessions, not from feel. On
+2026-10-13 a company setting — migration with a check constraint, model method,
+admin field and three test files — was estimated 90 minutes under v2 and took
+40. The same day a 27-task feature plan estimated at 53.5 h under v2 was rejected
+as padded; the accepted plan was 27.75 h. Add a measured pair here when an anchor
+moves.
 
 **Uncertainty is an open question, not a surcharge.** When you cannot size the
 work, you have found something the task does not say yet. Write that question
@@ -2261,7 +2274,10 @@ twice the real cost, which lost us work we should have won. The first fix was a
 30–50 % speedup factor with a 15–30 % buffer on top — but that chain put the
 padding straight back while sounding rigorous, and it produced a 0.58×–0.91×
 band on every single task. The anchors above carry the same judgement as one
-number. The measured feedback loop is the `teamwork-tasks-from-session` plugin,
+number. Version 2 still pictured an engineer who types the code with an
+assistant, and its anchors ran about twice the measured session time once Claude
+Code wrote the code itself (see *Calibration*). Version 3 halves the anchors and
+says who types. The measured feedback loop is the `teamwork-tasks-from-session` plugin,
 which shows the methodology estimate and the real logged session time side by
 side. When those two drift apart on the same kind of work, change the anchors
 here — never re-introduce a buffer percentage.

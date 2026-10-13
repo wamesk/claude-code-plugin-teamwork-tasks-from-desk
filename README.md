@@ -95,7 +95,7 @@ The skill then asks (via `AskUserQuestion`):
    have natural cut points (BE/FE/QA/migration/DevOps role prefixes).
 5. **Asks for an assignee email per role** when the task splits — each role
    can be answered independently or left empty.
-6. **Estimates** via the WAME estimate methodology `wame-estimate-v2`
+6. **Estimates** via the WAME estimate methodology `wame-estimate-v3`
    (one number per task against the anchors, 15 min step, split above 240 min, 480 min cap).
 7. **Pauses with clarifying questions** via `AskUserQuestion` in batches of 4,
    max 6 per run (questions about the cross-cutting requirements included);
