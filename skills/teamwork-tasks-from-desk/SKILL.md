@@ -58,6 +58,11 @@ silently somewhere in the Teamwork plugin family:
 - **Line lists are read with `while IFS= read -r X; do …; done <<<"$LIST"`.** An
   unquoted `for X in $LIST` iterates exactly once in zsh (no word splitting) —
   that is how every attachment id once became one malformed URL.
+- **Record lists too:** `printf '%s\n' "sub1 180" "sub2 120" | while IFS=' ' read -r KEY EST`.
+  Never `for SPEC in "sub1 180" …; do set -- $SPEC` — zsh does not split `$SPEC`,
+  so `$1` holds the whole record and `$2` is empty; every path built from `$1`
+  is wrong and every POST goes out with an empty body (HTTP 400 `expected a
+  request body` — four subtasks in a row on 2026-10-08).
 - **No bash-only expansions:** `${!ARR[@]}`, `${!name}`, `${X@Q}`, `${X,,}` all
   answer `bad substitution` in zsh (and the last two in macOS bash 3.2). zsh arrays
   are 1-based — read an element with the slice `${ARR[@]:$i:1}`, never `${ARR[$i]}`;
@@ -1082,6 +1087,14 @@ When proposed, each subtask gets:
 
 Count: 2–6. Never force-split smaller tasks.
 
+**Persist every draft to a file before Step 9.** Each Bash call is a fresh
+shell, so a `$SUB_DESC` variable set here does not exist in Step 11. Write the
+drafts under `WORK="${TMPDIR:-/tmp}/teamwork-tasks-from-desk-${RUN_ID}"` (the
+same run directory Step 3.3 created for attachments): `main_name.txt`,
+`main_desc.md`, and per subtask `sub<i>_name.txt`, `sub<i>_desc.md`,
+`sub<i>_est.txt` with `i` = 1..N in Step 5.3 order. Steps 10 and 11 read these
+files; Step 14.4 deletes the directory.
+
 ### 5.4 — Estimate
 
 Follow the **`## WAME estimate methodology`** block at the bottom of this
@@ -1102,8 +1115,14 @@ Three things are specific to this skill:
   `desk_skill.estimate.max_task_minutes` (480). Above
   `desk_skill.subtasks.propose_split_threshold_minutes` (240) the work splits via
   Step 5.3 instead.
-- Estimate every subtask independently, then make the main task's estimate the
-  **sum** of them. With no subtasks the main task carries its own number.
+- Estimate every subtask independently. `MAIN_EST` is their **sum** — shown in
+  the Step 9 preview, the Step 13 note and the Step 14 report — but it is
+  **written to the subtasks only**. The main task's own estimate field stays
+  empty (`0`) whenever subtasks follow: Teamwork rolls subtask estimates up into
+  the parent's `accumulatedEstimatedMinutes` and adds the parent's own field on
+  top, so a parent carrying the sum reports double (`estimateMinutes: 480` +
+  four subtasks = `accumulatedEstimatedMinutes: 960`, observed 2026-10-08 on
+  task #45483681). With no subtasks the main task carries its own number.
 
 A Desk ticket is written by a customer, not by an engineer, so it will usually
 be short one fact you need in order to size the work. That is an open question
@@ -1296,7 +1315,8 @@ The user must approve before any write happens.
 ### Main task
 
 - **Title:** <MAIN_NAME>
-- **Estimate:** <MAIN_EST> min
+- **Estimate:** <MAIN_EST> min <(with subtasks: "= sum of the subtasks; the main
+  task's own estimate field stays 0, Teamwork rolls the subtasks up")>
 - **Assignee:** <name> (or "unassigned")
 - **Attachments:** <count> — <filename1>, <filename2>, …
 - **Description:**
@@ -1325,7 +1345,8 @@ Then **AskUserQuestion**:
 - **Apply** — proceed to Step 10
 - **Edit main task** — user pastes corrections (free-form), re-render
 - **Edit subtask N** — same, per subtask
-- **Drop subtasks** — keep only the main task with the full estimate
+- **Drop subtasks** — keep only the main task; the full sum then goes into the
+  main task's own estimate field (Step 5.4)
 - **Cancel** — stop without any writes
 
 If `--write-back=never` → stop after rendering the preview (full dry-run, no
@@ -1363,12 +1384,18 @@ directly.
 # them raw — this avoids every quoting + escaping pitfall. NEVER splice the
 # name into Python source via shell quoting (e.g. ${MAIN_NAME@Q}): shell
 # quoting is not valid Python and a crafted name can break out and execute.
-NAME_PATH="$(mktemp)"
-printf '%s' "$MAIN_NAME" > "$NAME_PATH"
-DESC_PATH="$(mktemp)"
-printf '%s' "$MAIN_DESC" > "$DESC_PATH"
+WORK="${TMPDIR:-/tmp}/teamwork-tasks-from-desk-${RUN_ID}"   # drafts written in Step 5.3
+NAME_PATH="$WORK/main_name.txt"
+DESC_PATH="$WORK/main_desc.md"
+MAIN_NAME=$(cat "$NAME_PATH")
 
 EST_FIELD=$(jq -r '.desk_skill.task_create_estimate_field // "estimatedMinutes"' "$CONFIG_FILE")
+
+# The main task carries an estimate ONLY when it has no subtasks (Step 5.4).
+# With subtasks, Teamwork rolls their estimates up into the parent's
+# accumulatedEstimatedMinutes; a parent estimate on top counts the work twice.
+SUBTASK_COUNT=$(find "$WORK" -maxdepth 1 -name 'sub*_name.txt' | grep -c .)
+if [ "$SUBTASK_COUNT" -gt 0 ]; then MAIN_EST_FIELD_VALUE=0; else MAIN_EST_FIELD_VALUE=$MAIN_EST; fi
 
 PAYLOAD_PATH="$(mktemp)"
 python3 - "$NAME_PATH" "$DESC_PATH" "$PAYLOAD_PATH" <<PY
@@ -1380,9 +1407,11 @@ payload = {
     "task": {
         "name":            name,
         "description":     desc,
-        "${EST_FIELD}":    ${MAIN_EST},
     }
 }
+main_est = ${MAIN_EST_FIELD_VALUE:-0}
+if main_est:
+    payload["task"]["${EST_FIELD}"] = main_est
 assignee_id = ${ASSIGNEE_ID_FOR_MAIN:-0}
 if assignee_id:
     payload["task"]["assignees"] = {"userIds": [assignee_id]}
@@ -1445,7 +1474,8 @@ fi
 
 MAIN_TASK_URL="${BASE_URL}/app/tasks/${MAIN_TASK_ID}"
 echo "✅ Main task created: ${MAIN_NAME} (#${MAIN_TASK_ID})"
-rm -f "$NAME_PATH" "$DESC_PATH" "$PAYLOAD_PATH"
+printf '%s' "$MAIN_TASK_ID" > "$WORK/main_task_id.txt"   # Steps 11–13 run in fresh shells
+rm -f "$PAYLOAD_PATH"
 ```
 
 Non-2xx on the main POST → render the error body, stop. This is the
@@ -1521,56 +1551,82 @@ if [ -z "$SUB_ROLE" ]; then
 fi
 ```
 
-Then POST the subtask using the **same Python-encoded payload + correct write
-field** (`estimatedMinutes`) as Step 10:
+Then POST every subtask with the **same Python-encoded payload + correct write
+field** (`estimatedMinutes`) as Step 10. Unlike the main task, **every subtask
+carries its estimate** — the parent's field stays 0 (Step 5.4):
 
 ```bash
-# Write the subtask NAME and description to temp files so Python reads them
-# raw — never splice them into Python source via shell quoting (${SUB_NAME@Q}).
-SUB_NAME_PATH="$(mktemp)"
-printf '%s' "$SUB_NAME" > "$SUB_NAME_PATH"
-SUB_DESC_PATH="$(mktemp)"
-printf '%s' "$SUB_DESC" > "$SUB_DESC_PATH"
-SUB_PAYLOAD_PATH="$(mktemp)"
-python3 - "$SUB_NAME_PATH" "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH" <<PY
+# One loop over the drafts Step 5.3 persisted — NOT a hand-typed
+# `for SPEC in "sub1 180" "sub2 120"; do set -- $SPEC` (zsh keeps "sub1 180" as
+# one word, `$2` is empty, the payload file is never written and every POST
+# answers HTTP 400 "expected a request body"). The ids go to a file, because a
+# `while` fed by a pipe runs in a subshell in bash and `SUBTASK_IDS+=` would be
+# lost; Step 12 rebuilds the array from that file.
+WORK="${TMPDIR:-/tmp}/teamwork-tasks-from-desk-${RUN_ID}"
+MAIN_TASK_ID=$(cat "$WORK/main_task_id.txt")
+EST_FIELD=$(jq -r '.desk_skill.task_create_estimate_field // "estimatedMinutes"' "$CONFIG_FILE")
+: > "$WORK/subtask_ids.txt"
+find "$WORK" -maxdepth 1 -name 'sub*_name.txt' | sort -V | while IFS= read -r SUB_NAME_PATH; do
+  SUB_DESC_PATH="${SUB_NAME_PATH%_name.txt}_desc.md"
+  SUB_EST=$(tr -dc '0-9' < "${SUB_NAME_PATH%_name.txt}_est.txt")
+  SUB_NAME=$(cat "$SUB_NAME_PATH")
+  SUB_ROLE=$(printf '%s' "$SUB_NAME" | sed -nE 's|^\[([A-Za-z]+)\].*|\1|p')
+  SUB_ASSIGNEE_ID=$(jq -r --arg r "$SUB_ROLE" '.[$r] // ""' <<<"$ASSIGNEE_MAP")
+  [ -n "$SUB_ROLE" ] || SUB_ASSIGNEE_ID="${ASSIGNEE_ID_FOR_MAIN:-}"
+
+  # Name and description reach Python as file paths on argv — never spliced
+  # into Python source via shell quoting (${SUB_NAME@Q}).
+  SUB_PAYLOAD_PATH="$(mktemp)"
+  python3 - "$SUB_NAME_PATH" "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH" "$EST_FIELD" "${SUB_EST:-0}" "$MAIN_TASK_ID" "${SUB_ASSIGNEE_ID:-0}" <<'PY'
 import json, sys
-name = open(sys.argv[1]).read()
+name = open(sys.argv[1]).read().strip()
 desc = open(sys.argv[2]).read()
 payload = {
     "task": {
-        "name":            name,
-        "description":     desc,
-        "${EST_FIELD}":    ${SUB_EST},
-        "parentTaskId":    ${MAIN_TASK_ID},
+        "name":         name,
+        "description":  desc,
+        sys.argv[4]:    int(sys.argv[5]),
+        "parentTaskId": int(sys.argv[6]),
     }
 }
-uid = ${SUB_ASSIGNEE_ID:-0}
+uid = int(sys.argv[7] or 0)
 if uid:
     payload["task"]["assignees"] = {"userIds": [uid]}
 json.dump(payload, open(sys.argv[3], "w"), ensure_ascii=False)
 PY
 
-SUB_RESP=$(curl -sS -u "$PROJECTS_AUTH" \
-  -H "Content-Type: application/json" \
-  -X POST -d @"$SUB_PAYLOAD_PATH" \
-  "${BASE_URL}/projects/api/v3/tasklists/${TASKLIST_ID}/tasks.json")
+  HTTP=$(curl -sS -u "$PROJECTS_AUTH" \
+    -H "Content-Type: application/json" -H "Accept: application/json" \
+    -X POST -d @"$SUB_PAYLOAD_PATH" \
+    -o /tmp/tw_sub_resp.json -w '%{http_code}' \
+    "${BASE_URL}/projects/api/v3/tasklists/${TASKLIST_ID}/tasks.json")
 
-# Feed the raw server response via stdin (like the main-task response is read
-# from a file) — never splice it into Python source via ${SUB_RESP@Q}.
-SUB_ID=$(printf '%s' "$SUB_RESP" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
+  # The server response is read from the file — never spliced into Python
+  # source via ${SUB_RESP@Q}.
+  SUB_ID=$(python3 -c "
+import json
+d = json.load(open('/tmp/tw_sub_resp.json'))
 t = d.get('task', d)
 print(t.get('id') or '')")
-if [ -n "$SUB_ID" ]; then
-  SUBTASK_IDS+=("$SUB_ID")
-  echo "✅ Subtask created: ${SUB_NAME} (#${SUB_ID})"
-else
-  SUBTASK_FAILURES+=("${SUB_NAME}: $SUB_RESP")
-  echo "❌ Subtask failed: ${SUB_NAME}"
-fi
-rm -f "$SUB_NAME_PATH" "$SUB_DESC_PATH" "$SUB_PAYLOAD_PATH"
+  if [ -n "$SUB_ID" ]; then
+    printf '%s\n' "$SUB_ID" >> "$WORK/subtask_ids.txt"
+    echo "✅ Subtask created: ${SUB_NAME} (#${SUB_ID}, ${SUB_EST} min)"
+  else
+    echo "❌ Subtask failed: ${SUB_NAME} (HTTP $HTTP): $(head -c 300 /tmp/tw_sub_resp.json)"
+  fi
+  rm -f "$SUB_PAYLOAD_PATH"
+done
+
+# Verify the roll-up: the parent's own field must read 0 and the accumulated
+# value must equal the sum of the subtasks (Step 5.4). A parent that still
+# carries its own number reports the work twice.
+curl -sS -u "$PROJECTS_AUTH" "${BASE_URL}/projects/api/v3/tasks/${MAIN_TASK_ID}.json" \
+  | jq -r '.task | "main estimateMinutes=\(.estimateMinutes) accumulatedEstimatedMinutes=\(.accumulatedEstimatedMinutes)"'
 ```
+
+`SUBTASK_IDS` for Step 12 is rebuilt in that step's own Bash call:
+`SUBTASK_IDS=( $(cat "$WORK/subtask_ids.txt") )` — one id per line, in Step 5.3
+order, so index `i` still lines up with `SUBTASK_FILES_<i>`.
 
 Per-subtask failure is **non-fatal** — log and continue with the rest.
 
@@ -1759,7 +1815,7 @@ Template:
 
 <p><b>Task:</b> <a href="<MAIN_TASK_URL>"><MAIN_NAME></a> (#<MAIN_TASK_ID>)<br>
 <b>Project:</b> <PROJECT_NAME> · <b>Tasklist:</b> <TASKLIST_NAME><br>
-<b>Estimate:</b> <MAIN_EST> min (~<HOURS> h)<br>
+<b>Estimate:</b> <MAIN_EST> min (~<HOURS> h)<with subtasks: " — súčet subtaskov"><br>
 <b>Assignee:</b> <name or "unassigned"></p>
 
 <h4>📎 Attachments</h4>
@@ -2032,7 +2088,7 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
 
 **Desk ticket:** <SUBJECT> (#<TICKET_ID>) — <DESK_BASE>/tickets/<TICKET_ID>
 **Projects task:** <MAIN_NAME> (#<MAIN_TASK_ID>) — <MAIN_TASK_URL>
-**Estimate:** <MAIN_EST> min · **Assignee:** <name or "unassigned">
+**Estimate:** <MAIN_EST> min <with subtasks: "(sum of subtasks; parent field 0, accumulatedEstimatedMinutes verified)"> · **Assignee:** <name or "unassigned">
 
 ### ⏱ Run duration
 - Started: <RUN_START_ISO>
@@ -2223,6 +2279,8 @@ here — never re-introduce a buffer percentage.
 - Never marks the new task or subtasks as complete
 - Never writes the estimate into the task title or the task description — the
   Teamwork estimate field (`estimatedMinutes`) is its only home
+- Never writes an estimate on a main task that has subtasks — the subtasks carry
+  it and Teamwork rolls it up (`accumulatedEstimatedMinutes`); both set = double
 - Never runs `git commit`, `git push`, or any git command
 - Never drops an inline image, an `<img>` tag or an attachment reference out of
   the customer's words when carrying them into the preamble — a screenshot

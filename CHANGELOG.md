@@ -4,6 +4,39 @@ All notable changes to the `teamwork-tasks-from-desk` plugin are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] — 2026-10-13
+
+Written on 2026-10-08 as 1.3.1 in a separate checkout and never published; 1.3.1
+was released from here with the description fix instead, so the estimate fix
+ships now as 1.3.2.
+
+Both defects surfaced on the first production run of 1.3.0 (Desk #10193773 →
+task #45483681, four subtasks).
+
+### Fixed
+- **The estimate was counted twice when the task had subtasks.** Step 5.4 made
+  the main task's estimate the sum of the subtasks *and* every subtask carried
+  its own number. Teamwork rolls subtask estimates up into the parent's
+  `accumulatedEstimatedMinutes` and adds the parent's own field on top, so 480
+  minutes of work reported as 960. The main task's estimate field now stays `0`
+  whenever subtasks follow; the sum is shown in the preview, the Desk note and
+  the report only. Step 11 reads the roll-up back (`estimateMinutes: 0`,
+  `accumulatedEstimatedMinutes` = sum) before the run reports success.
+- **Every subtask POST went out with an empty body in zsh.** Step 11 described
+  the per-subtask call but left the loop to improvisation; the obvious
+  `for SPEC in "sub1 180" "sub2 120"; do set -- $SPEC` keeps `"sub1 180"` as one
+  word in zsh, `$2` is empty, the payload file is never written and all four
+  POSTs answered HTTP 400 `expected a request body`. Step 11 now ships one
+  zsh-safe loop over per-subtask draft files, records the ids in a file (a
+  piped `while` is a subshell in bash) and the shell contract names the
+  `set -- $SPEC` trap next to the `for X in $LIST` one.
+
+### Changed
+- Step 5.3 persists every draft (`main_name.txt`, `main_desc.md`,
+  `sub<i>_name.txt`, `sub<i>_desc.md`, `sub<i>_est.txt`) to the run directory,
+  because each Bash call is a fresh shell; Steps 10 and 11 read those files
+  instead of variables that no longer exist.
+
 ## [1.3.1] — 2026-10-12
 
 ### Changed
