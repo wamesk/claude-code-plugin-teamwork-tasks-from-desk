@@ -4,6 +4,17 @@ All notable changes to the `teamwork-tasks-from-desk` plugin are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-10-16
+
+### Changed
+- **Estimate methodology moved to the `work-rules` plugin.** The `wame-estimate-v3`
+  block that was copied verbatim into this plugin now lives in the
+  tracker-independent `work-rules` plugin (skill `wame-estimate`) and is loaded
+  at run time; `## WAME estimate methodology` is now a short pointer to it.
+  The plugin declares `work-rules` in `dependencies`. Rules and numbers are
+  unchanged. Reason: one source instead of five copies, and the rules must
+  survive WAME's move away from Teamwork.
+
 ## [1.4.0] — 2026-10-13
 
 ### Changed

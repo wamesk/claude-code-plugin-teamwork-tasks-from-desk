@@ -17,6 +17,8 @@ original ticket.
 /plugin install teamwork-tasks-from-desk@wame
 ```
 
+The plugin requires the `work-rules` plugin (skill `wame-estimate`, the estimate methodology `wame-estimate-v3`). It is declared in `dependencies`, so it installs together with this plugin; if it is missing, run `/plugin install work-rules@wame`.
+
 The **Projects** API token is shared with the `teamwork-task`,
 `teamwork-task-test` and `teamwork-task-analyze` plugins — if any of those is
 already configured, this plugin uses the same token. The **Desk** API token is
@@ -95,7 +97,7 @@ The skill then asks (via `AskUserQuestion`):
    have natural cut points (BE/FE/QA/migration/DevOps role prefixes).
 5. **Asks for an assignee email per role** when the task splits — each role
    can be answered independently or left empty.
-6. **Estimates** via the WAME estimate methodology `wame-estimate-v3`
+6. **Estimates** via the WAME estimate methodology `wame-estimate-v3` (from the `work-rules` plugin)
    (one number per task against the anchors, 15 min step, split above 240 min, 480 min cap).
 7. **Pauses with clarifying questions** via `AskUserQuestion` in batches of 4,
    max 6 per run (questions about the cross-cutting requirements included);
